@@ -1,0 +1,29 @@
+name: Version Manager (with override)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'version number to honor (no v... ex 8.0.0.10)'
+        required: false
+        type: string
+        default: ""
+  pull_request:
+    branches:
+      - '**'
+
+permissions:
+  contents: read # read is needed to get the tags from the repository
+      
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }} 
+  cancel-in-progress: true # Because the version can be branch bound, cancel existing runs on the ref
+  
+jobs:
+  versioner:
+    if: ${{ github.event_name == 'pull_request' }}
+    uses: gks-composite/.github/.github/workflows/Global-Version.yml@main
+    secrets: inherit
+    with:
+      version: ${{ github.event.inputs.version || '' }}
+

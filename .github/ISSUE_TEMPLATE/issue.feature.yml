@@ -1,0 +1,48 @@
+# Based on the issue template
+name: Feature request
+description: Suggest an idea or enhancement for this project
+title: "[FEATURE] <title>"
+labels: [enhancement]
+body:
+  - type: checkboxes
+    attributes:
+      label: Is there an existing feature request for this?
+      description: Search for existing issues or feature requests before submitting a new one.
+      options:
+        - label: I have searched the existing issues and feature requests
+          required: true
+  - type: textarea
+    attributes:
+      label: Feature Description
+      description: Describe the feature or enhancement you would like to see.
+      placeholder: |
+        Clearly describe the feature, its purpose, and the problem it solves.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Proposed Solution
+      description: If you have a suggestion for how to implement this, let us know.
+      placeholder: |
+        1. Describe your proposed solution or approach
+        2. Any alternatives you have considered
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: Additional Context
+      description: Add any other context, screenshots, or references about the feature request here.
+      placeholder: |
+        Links to relevant documentation, workflows, or related issues
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      description: |
+        Provide logs or output from GitHub Actions or composite pipeline runs relevant to this feature request (if applicable)
+      label: Workflow logs
+      placeholder: |
+        Output of relevant GitHub Actions or composite pipeline steps
+      render: bash
+    validations:
+      required: false

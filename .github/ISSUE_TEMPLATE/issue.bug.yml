@@ -1,0 +1,39 @@
+# Based on the issue template
+name: Bug report
+description: Create a report to help us improve
+title: "[BUG] <title>"
+labels: [bug]
+body:
+  - type: checkboxes
+    attributes:
+      label: Is there an existing issue for this?
+      description: Search for existing issues related to this bug.
+      options:
+        - label: I have searched the existing issues
+          required: true
+  - type: textarea
+    attributes:
+      label: Behavior
+    validations:
+      # This field is required to help us understand the issue.
+      required: true
+  - type: textarea
+    attributes:
+      label: Reproduction Steps
+      description: Steps to reproduce the issue.
+      placeholder: |
+        1. Steps to set up the environment
+        2. Actions performed to reproduce the issue
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      description: |
+        Provide logs or output from GitHub Actions or composite pipeline runs relevant to the issue
+      label: Workflow logs
+      placeholder: |
+        Output of failed or relevant GitHub Actions or composite pipeline steps
+      # Specifies that the workflow logs should be rendered as bash code for better readability.
+      render: bash
+    validations:
+      required: true

@@ -1,0 +1,7 @@
+{
+    "name": "Version Manager (with override)",
+    "description": "Manage versioning of the repository with optional override",
+    "iconName": "",
+    "categories": [""],
+    "filePatterns": []
+}
