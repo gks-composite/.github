@@ -21,7 +21,7 @@ concurrency:
   
 jobs:
   versioner:
-    if: ${{ github.event_name == 'pull_request' }}
+    if: ${{ github.event_name != 'pull_request' }}
     uses: gks-composite/.github/.github/workflows/Global-Version.yml@main
     secrets: inherit
     with:
