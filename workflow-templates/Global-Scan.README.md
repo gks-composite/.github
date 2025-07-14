@@ -27,10 +27,10 @@ This workflow is designed to be called as a reusable workflow using the `uses` k
 name: Global Scan
 
 on:
-  workflow_call:
+  workflow_dispatch:
     inputs:
       working_dir:
-        description: 'directory should be scanned'
+        description: 'Directory to be scanned'
         required: false
         type: string
         default: ""
