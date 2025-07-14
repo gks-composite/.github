@@ -27,17 +27,17 @@ This workflow is designed to be called as a reusable workflow using the `uses` k
 name: Global Scan
 
 on:
-  workflow_call:
+  workflow_dispatch:
     inputs:
       working_dir:
-        description: 'directory should be scanned'
+        description: 'Directory to be scanned'
         required: false
         type: string
         default: ""
 
 jobs:
   scan:
-    uses: gks-composite/.github/.github/workflows/global-scan.yml@main
+    uses: gks-composite/.github/.github/workflows/Global-Scan.yml@main
     secrets: inherit
     with:
       working_dir: ${{ inputs.working_dir || '' }}

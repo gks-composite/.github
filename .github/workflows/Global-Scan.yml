@@ -26,7 +26,7 @@ jobs:
           persist-credentials: false
 
       - name: Run Trivy Scan
-        uses: Xander-Rudolph/trivy-scan@main
+        uses: Xander-Rudolph/trivy-scan@ee0df9e573d42786b17f68c93cfd139a5ad01707 # main as of 2025-1-22
         with:
           severity: "HIGH,CRITICAL"
           working_dir: ${{ inputs.working_dir || github.workspace }}
