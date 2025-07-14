@@ -37,7 +37,7 @@ on:
 
 jobs:
   scan:
-    uses: gks-composite/.github/.github/workflows/global-scan.yml@main
+    uses: gks-composite/.github/.github/workflows/Global-Scan.yml@main
     secrets: inherit
     with:
       working_dir: ${{ inputs.working_dir || '' }}
