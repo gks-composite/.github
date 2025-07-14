@@ -1,0 +1,13 @@
+name: Generic Global Scanner
+
+on:
+  pull_request:
+    branches:
+      - '**'
+
+jobs:
+  scan:
+    uses: gks-composite/.github/.github/workflows/Global-Scan.yml@main
+    secrets: inherit
+    with:
+      working_dir: ${{ github.workspace }}

@@ -7,7 +7,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }} 
-  cancel-in-progress: true # Because the version can be branch bound, cancel existing runs on the ref
+  cancel-in-progress: true # This updates PRs so it should be canceled if another run kicks off
   
 jobs:
   lint:
