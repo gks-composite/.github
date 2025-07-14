@@ -1,0 +1,7 @@
+{
+    "name": "Global Scan (on demand)",
+    "description": "Generic Global Security Scanner for all repositories using Trivy.",
+    "iconName": "",
+    "categories": ["security", "scan", "vulnerability"],
+    "filePatterns": []
+}

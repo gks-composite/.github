@@ -17,6 +17,8 @@ jobs:
     if: ${{ github.event_name != 'pull_request'}}
     runs-on: windows-latest
     name: ${{ inputs.version != '' && format('Manual Version {0}', inputs.version) || 'Auto Version' }}
+    permissions:
+      contents: read # read is needed to get the tags from the repository
     outputs:
       version: ${{ inputs.version != '' && inputs.version || steps.version.outputs.version }}
     steps:

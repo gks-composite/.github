@@ -12,16 +12,12 @@ on:
     branches:
       - '**'
 
-permissions:
-  contents: read # read is needed to get the tags from the repository
-      
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }} 
   cancel-in-progress: true # Because the version can be branch bound, cancel existing runs on the ref
   
 jobs:
   versioner:
-    if: ${{ github.event_name == 'pull_request' }}
     uses: gks-composite/.github/.github/workflows/Global-Version.yml@main
     secrets: inherit
     with:

@@ -1,0 +1,32 @@
+name: Generic Global Scanner
+
+on:
+  workflow_call:
+    inputs:
+      working_dir:
+        description: 'directory should be scanned'
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+      statuses: write
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Run Trivy Scan
+        uses: Xander-Rudolph/trivy-scan@main
+        with:
+          severity: "HIGH,CRITICAL"
+          working_dir: ${{ inputs.working_dir || github.workspace }}

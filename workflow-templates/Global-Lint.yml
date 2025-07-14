@@ -1,0 +1,19 @@
+name: Version Manager (with override)
+
+on:
+  pull_request:
+    branches:
+      - '**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }} 
+  cancel-in-progress: true # This updates PRs so it should be canceled if another run kicks off
+  
+jobs:
+  lint:
+    if: ${{ github.event_name == 'pull_request' }}
+    uses: gks-composite/.github/.github/workflows/Global-Lint.yml@main
+    secrets: inherit
+    with:
+      branch: ${{ github.event.pull_request.base.ref || github.base_ref || github.ref_name || 'main' }}
+
