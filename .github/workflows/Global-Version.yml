@@ -16,7 +16,6 @@ permissions:
       
 jobs:
   versioner:
-    if: ${{ github.event_name != 'pull_request'}}
     runs-on: windows-latest
     name: ${{ inputs.version != '' && format('Manual Version {0}', inputs.version) || 'Auto Version' }}
     permissions:
