@@ -8,7 +8,9 @@ on:
         required: false
         type: string
         default: ""
-
+    secrets:
+      GITHUB_TOKEN:
+        required: true
 permissions:
   contents: read
       
@@ -22,11 +24,11 @@ jobs:
     outputs:
       version: ${{ inputs.version != '' && inputs.version || steps.version.outputs.version }}
     steps:
-      - name: ${{ secrets.OVERRIDE_TOKEN != '' && 'Checkout repo (override)' || 'Checkout repo (default)' }}        
+      - name: ${{ secrets.GITHUB_TOKEN != '' && 'Checkout repo (override)' || 'Checkout repo (default)' }}        
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.OVERRIDE_TOKEN || secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           persist-credentials: false
 
       - name: Create Version
