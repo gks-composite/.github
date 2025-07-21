@@ -9,8 +9,8 @@ on:
         type: string
         default: ""
     secrets:
-      GITHUB_TOKEN:
-        required: true
+      OVERRIDE_TOKEN:
+        required: false
 jobs:
   scan:
     runs-on: ubuntu-latest
@@ -23,7 +23,7 @@ jobs:
         with:
           fetch-depth: 0
           lfs: true
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.OVERRIDE_TOKEN || secrets.GITHUB_TOKEN }}
           submodules: recursive
           persist-credentials: false
 

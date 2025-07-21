@@ -9,8 +9,8 @@ on:
         type: string
         default: ""
     secrets:
-      GITHUB_TOKEN:
-        required: true
+      OVERRIDE_TOKEN:
+        required: false
         
 jobs:
   lint:
@@ -26,7 +26,7 @@ jobs:
         with:
           fetch-depth: 0
           lfs: true
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.OVERRIDE_TOKEN || secrets.GITHUB_TOKEN }}
           submodules: recursive
           persist-credentials: true
 
@@ -34,7 +34,7 @@ jobs:
         uses: super-linter/super-linter@v7.3.0 # x-release-please-version
         env:
           DEFAULT_BRANCH: ${{ inputs.branch || github.event.repository.default_branch || 'main'}}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.OVERRIDE_TOKEN || secrets.GITHUB_TOKEN }}
           DISABLE_ERRORS: true
           FIX_JSON_PRETTIER: true
           FIX_YAML_PRETTIER: true
