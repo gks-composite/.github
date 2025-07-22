@@ -8,13 +8,18 @@ on:
         required: false
         type: string
         default: ""
-
+    outputs:
+      version:
+        description: "Automatic Version Number"
+        value: ${{ jobs.versioner.outputs.version }}
+    secrets:
+      OVERRIDE_TOKEN:
+        required: true
 permissions:
   contents: read
       
 jobs:
   versioner:
-    if: ${{ github.event_name != 'pull_request'}}
     runs-on: windows-latest
     name: ${{ inputs.version != '' && format('Manual Version {0}', inputs.version) || 'Auto Version' }}
     permissions:
