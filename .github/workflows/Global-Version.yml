@@ -8,6 +8,10 @@ on:
         required: false
         type: string
         default: ""
+    outputs:
+      version:
+        description: "Automatic Version Number"
+        value: ${{ jobs.versioner.outputs.version }}
     secrets:
       OVERRIDE_TOKEN:
         required: true
