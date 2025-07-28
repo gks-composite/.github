@@ -14,7 +14,7 @@ on:
         value: ${{ jobs.versioner.outputs.version }}
     secrets:
       OVERRIDE_TOKEN:
-        required: true
+        required: false
 permissions:
   contents: read
       
