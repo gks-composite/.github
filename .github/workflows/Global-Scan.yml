@@ -7,7 +7,7 @@ on:
         description: 'directory should be scanned'
         required: false
         type: string
-        default: ""
+        default: "."
     secrets:
       OVERRIDE_TOKEN:
         required: false
@@ -17,6 +17,7 @@ jobs:
     permissions:
       packages: read
       statuses: write
+      contents: write
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -31,10 +32,4 @@ jobs:
         uses: Xander-Rudolph/trivy-scan@ee0df9e573d42786b17f68c93cfd139a5ad01707 # main as of 2025-1-22
         with:
           severity: "HIGH,CRITICAL"
-          working_dir: ${{ inputs.working_dir || github.workspace }}
-
-      - name: Upload results json
-        uses: actions/upload-artifact@v4
-        with:
-          name: trivy-json
-          path: "${{ inputs.working_dir || github.workspace }}/.-fs.json"
+          working_dir: ${{ inputs.working_dir }}
