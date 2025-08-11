@@ -46,13 +46,7 @@ jobs:
           FIX_PYTHON_PYINK: true
           FIX_PYTHON_ISORT: true
           FIX_PYTHON_BLACK: true
-
-      - name: DEBUG Upload workflow file
-        uses: actions/upload-artifact@v4
-        with:
-          name: DEBUG
-          path: "${{ github.workspace }}/.github/workflows/main.yml"
-
+          
       - name: Commit and push linting fixes
         uses: stefanzweifel/git-auto-commit-action@v5
         env:
