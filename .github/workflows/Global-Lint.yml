@@ -47,13 +47,18 @@ jobs:
           FIX_PYTHON_ISORT: true
           FIX_PYTHON_BLACK: true
 
+      - name: DEBUG Upload workflow file
+        uses: actions/upload-artifact@v4
+        with:
+          name: DEBUG
+          path: "${{ github.workspace }}/.github/workflows/main.yml"
+
       - name: Commit and push linting fixes
         uses: stefanzweifel/git-auto-commit-action@v5
         env:
           GITHUB_TOKEN: ${{ secrets.OVERRIDE_TOKEN || secrets.GITHUB_TOKEN }}
         with:
           branch: ${{ github.event.pull_request.head.ref || github.head_ref || github.ref }}
-          GITHUB_TOKEN: ${{ secrets.OVERRIDE_TOKEN || secrets.GITHUB_TOKEN }}
           commit_message: "chore: fix linting issues"
           commit_user_name: ${{ github.actor }}
           commit_user_email: "${{ github.actor }}@users.noreply.github.com"
