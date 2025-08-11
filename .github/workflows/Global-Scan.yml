@@ -7,7 +7,7 @@ on:
         description: 'directory should be scanned'
         required: false
         type: string
-        default: ""
+        default: "."
     secrets:
       OVERRIDE_TOKEN:
         required: false
