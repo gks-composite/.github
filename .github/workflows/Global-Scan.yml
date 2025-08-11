@@ -33,9 +33,3 @@ jobs:
         with:
           severity: "HIGH,CRITICAL"
           working_dir: ${{ inputs.working_dir }}
-
-      - name: Upload results json
-        uses: actions/upload-artifact@v4
-        with:
-          name: trivy-json
-          path: "${{ github.workspace }}/${{ inputs.working_dir }}-fs-report.md"
