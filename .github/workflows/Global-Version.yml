@@ -20,7 +20,7 @@ permissions:
       
 jobs:
   versioner:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     name: ${{ inputs.version != '' && format('Manual Version {0}', inputs.version) || 'Auto Version' }}
     permissions:
       contents: read # read is needed to get the tags from the repository
@@ -32,7 +32,7 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.OVERRIDE_TOKEN || secrets.GITHUB_TOKEN }}
-          # persist-credentials: false
+          persist-credentials: false
 
       - name: Create Version
         id: version
