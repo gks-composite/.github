@@ -20,7 +20,7 @@ permissions:
       
 jobs:
   versioner:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     name: ${{ inputs.version != '' && format('Manual Version {0}', inputs.version) || 'Auto Version' }}
     permissions:
       contents: read # read is needed to get the tags from the repository
