@@ -8,6 +8,11 @@ on:
         required: false
         type: string
         default: ""
+      defaultBranch:
+        description: "Branch for resetting minor version (EX: main)"
+        required: false
+        type: string
+        default: main
     outputs:
       version:
         description: "Automatic Version Number"
@@ -41,4 +46,4 @@ jobs:
         uses: gks-composite/global-version@main
         with:
           tagPrefix: v
-          defaultBranch: main
+          defaultBranch: ${{ inputs.defaultBranch }}
