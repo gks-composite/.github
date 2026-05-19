@@ -1,35 +1,129 @@
-name: Generic Global Scanner
+name: Global Scanner
 
 on:
   workflow_call:
     inputs:
-      working_dir:
-        description: 'directory should be scanned'
+      image:
+        description: 'GHCR image ref to scan (e.g. ghcr.io/facefirst-engineering/faceio:latest). Omit to skip image scan.'
         required: false
         type: string
-        default: "."
+        default: ''
     secrets:
       OVERRIDE_TOKEN:
         required: false
+
+permissions:
+  contents: read
+  packages: read
+
 jobs:
-  scan:
+  detect:
     runs-on: ubuntu-latest
-    permissions:
-      packages: read
-      statuses: write
-      contents: write
+    outputs:
+      dotnet-paths: ${{ steps.parse.outputs.dotnet-paths }}
+      has-dotnet:   ${{ steps.parse.outputs.has-dotnet }}
+      node-paths:   ${{ steps.parse.outputs.node-paths }}
+      has-node:     ${{ steps.parse.outputs.has-node }}
+      has-msbuild:  ${{ steps.parse.outputs.has-msbuild }}
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          lfs: true
           token: ${{ secrets.OVERRIDE_TOKEN || secrets.GITHUB_TOKEN }}
           submodules: recursive
-          persist-credentials: false
 
-      - name: Run Trivy Scan
-        uses: Xander-Rudolph/trivy-scan@ee0df9e573d42786b17f68c93cfd139a5ad01707 # main as of 2025-1-22
+      - id: lang
+        uses: gks-composite/language-detection@main
         with:
-          severity: "HIGH,CRITICAL"
-          working_dir: ${{ inputs.working_dir }}
+          fetch-depth: '5'
+
+      - id: parse
+        shell: pwsh
+        run: |
+          $raw = '${{ steps.lang.outputs.languagePaths }}'
+          $paths = if ($raw -ne '' -and $raw -ne 'null') { $raw | ConvertFrom-Json } else { [PSCustomObject]@{} }
+
+          $dotnet = if ($paths.'C-sharp') { $paths.'C-sharp' | ConvertTo-Json -Compress } else { '[]' }
+          $node   = if ($paths.'NodeJS')  { $paths.'NodeJS'  | ConvertTo-Json -Compress } else { '[]' }
+
+          $hasDotnet = ($null -ne $paths.'C-sharp' -and @($paths.'C-sharp').Count -gt 0).ToString().ToLower()
+          $hasNode   = ($null -ne $paths.'NodeJS'  -and @($paths.'NodeJS').Count  -gt 0).ToString().ToLower()
+
+          # language-detection does not detect .vcxproj; check directly for MSBuild C++ repos
+          $hasMsbuild = ((Get-ChildItem -Recurse -Filter '*.vcxproj' -ErrorAction SilentlyContinue).Count -gt 0).ToString().ToLower()
+
+          "dotnet-paths=$dotnet"    >> $env:GITHUB_OUTPUT
+          "has-dotnet=$hasDotnet"   >> $env:GITHUB_OUTPUT
+          "node-paths=$node"        >> $env:GITHUB_OUTPUT
+          "has-node=$hasNode"       >> $env:GITHUB_OUTPUT
+          "has-msbuild=$hasMsbuild" >> $env:GITHUB_OUTPUT
+
+  scan-dotnet:
+    needs: detect
+    if: needs.detect.outputs.has-dotnet == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        path: ${{ fromJSON(needs.detect.outputs.dotnet-paths) }}
+    name: Scan .NET (${{ matrix.path }})
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.OVERRIDE_TOKEN || secrets.GITHUB_TOKEN }}
+      - uses: Xander-Rudolph/trivy-scan@ee0df9e573d42786b17f68c93cfd139a5ad01707
+        with:
+          severity: HIGH,CRITICAL
+          working_dir: ${{ matrix.path }}
+
+  scan-node:
+    needs: detect
+    if: needs.detect.outputs.has-node == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        path: ${{ fromJSON(needs.detect.outputs.node-paths) }}
+    name: Scan Node (${{ matrix.path }})
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.OVERRIDE_TOKEN || secrets.GITHUB_TOKEN }}
+      - uses: Xander-Rudolph/trivy-scan@ee0df9e573d42786b17f68c93cfd139a5ad01707
+        with:
+          severity: HIGH,CRITICAL
+          working_dir: ${{ matrix.path }}
+
+  scan-msbuild:
+    needs: detect
+    if: needs.detect.outputs.has-msbuild == 'true'
+    runs-on: ubuntu-latest
+    name: Scan MSBuild (C++)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.OVERRIDE_TOKEN || secrets.GITHUB_TOKEN }}
+          submodules: recursive
+      - uses: Xander-Rudolph/trivy-scan@ee0df9e573d42786b17f68c93cfd139a5ad01707
+        with:
+          severity: HIGH,CRITICAL
+          working_dir: .
+
+  scan-image:
+    if: inputs.image != ''
+    runs-on: ubuntu-latest
+    name: Scan Image
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.OVERRIDE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: ${{ inputs.image }}
+          format: table
+          severity: HIGH,CRITICAL
+          scanners: vuln,misconfig,secret
