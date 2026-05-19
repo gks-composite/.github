@@ -28,12 +28,12 @@ jobs:
     runs-on: ubuntu-latest
     name: ${{ inputs.version != '' && format('Manual Version {0}', inputs.version) || 'Auto Version' }}
     permissions:
-      contents: read # read is needed to get the tags from the repository
+      contents: read
     outputs:
       version: ${{ inputs.version != '' && inputs.version || steps.version.outputs.version }}
     steps:
-      - name: ${{ secrets.OVERRIDE_TOKEN != '' && 'Checkout repo (override)' || 'Checkout repo (default)' }}        
-        uses: actions/checkout@v5
+      - name: ${{ secrets.OVERRIDE_TOKEN != '' && 'Checkout repo (override)' || 'Checkout repo (default)' }}
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.ref }}
           fetch-depth: 0
