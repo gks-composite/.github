@@ -1,0 +1,7 @@
+{
+    "name": "Docker Build and Push (GHCR)",
+    "description": "Uniform Docker build, Trivy fs + image scan, semantic tagging, and push to GHCR with tiered scan gating and hardened releases.",
+    "iconName": "",
+    "categories": ["deployment", "docker", "container", "security"],
+    "filePatterns": ["Dockerfile$", ".*/Dockerfile$", "dockerfile$"]
+}

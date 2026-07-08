@@ -1,0 +1,39 @@
+name: Docker Build and Push
+
+on:
+  push:
+    branches:
+      - $default-branch
+      - $protected-branches
+  pull_request:
+    branches:
+      - $default-branch
+  workflow_dispatch:
+    inputs:
+      environment-tag:
+        description: 'Optional promotion tag to also apply (e.g. latest-qa, latest-prod)'
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker:
+    uses: gks-composite/.github/.github/workflows/Docker-Build-Push.yml@main
+    # Uses the built-in GITHUB_TOKEN only (no PATs). Grant packages: write, and make
+    # sure this repo has access to the image package it pushes and to any internal
+    # dependency packages it restores (Org → Packages → package → Manage access).
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      # Required: the image name published to ghcr.io/<owner>/<image-name>
+      image-name: CHANGE-ME
+      context: .
+      dockerfile: Dockerfile
+      # target:            # optional build stage, e.g. runtime-server
+      # platforms: linux/amd64
+      environment-tag: ${{ github.event.inputs.environment-tag || '' }}
