@@ -212,7 +212,7 @@ jobs:
       # ----- Source (filesystem) scan -----
       - name: Trivy filesystem scan
         if: ${{ inputs.fs-scan }}
-        uses: gks-composite/.github/actions/trivy-scan@main
+        uses: gks-composite/trivy-scan@v1
         with:
           scan-type: fs
           scan-ref: ${{ inputs.context }}
@@ -270,7 +270,7 @@ jobs:
       # ----- Image scan -----
       - name: Trivy image scan
         if: ${{ inputs.image-scan }}
-        uses: gks-composite/.github/actions/trivy-scan@main
+        uses: gks-composite/trivy-scan@v1
         with:
           scan-type: image
           scan-ref: local-scan:${{ github.run_id }}
