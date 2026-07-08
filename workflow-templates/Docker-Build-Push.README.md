@@ -10,6 +10,16 @@ repository the same behaviour:
 5. **Push** — multi-tag push to GHCR. Pull requests also push with identifiable `pr-<n>` / `sha-<sha>` tags.
 6. **Harden** — SBOM + provenance attestations (and optional cosign signing) on default-branch / release-tag builds.
 
+## Authentication (no PATs)
+
+The pipeline uses the built-in **`GITHUB_TOKEN`** only — for both the GHCR push and the in-Docker
+dependency restore. There is no PAT and no fallback, so misconfigured access **fails the build**
+loudly instead of silently. Two requirements:
+
+- The calling job grants **`permissions: packages: write`** (shown below).
+- The repo is **granted access to the packages** it uses — the image package it pushes, and any
+  internal dependency packages it restores (Org → Packages → *package* → *Manage access* → add the repo).
+
 ## Adding it to a repository
 
 1. Repo → **Actions** → **New workflow** → choose **Docker Build and Push (GHCR)**.
@@ -22,12 +32,14 @@ repository the same behaviour:
 jobs:
   docker:
     uses: gks-composite/.github/.github/workflows/Docker-Build-Push.yml@main
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     with:
       image-name: fcm-proxy
       context: .
       dockerfile: Dockerfile
-    secrets:
-      build-token: ${{ secrets.GH_PACKAGETOKEN }}   # private NuGet restore
 ```
 
 ## Example — one Dockerfile, multiple images (build targets)
@@ -36,20 +48,24 @@ jobs:
 jobs:
   server:
     uses: gks-composite/.github/.github/workflows/Docker-Build-Push.yml@main
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     with:
       image-name: licenseserver
       dockerfile: Dockerfile
       target: runtime-server
-    secrets:
-      build-token: ${{ secrets.GH_PACKAGETOKEN }}
   admin:
     uses: gks-composite/.github/.github/workflows/Docker-Build-Push.yml@main
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     with:
       image-name: adminapi
       dockerfile: Dockerfile
       target: runtime-admin
-    secrets:
-      build-token: ${{ secrets.GH_PACKAGETOKEN }}
 ```
 
 ## Example — monorepo of images (matrix)
@@ -61,6 +77,10 @@ jobs:
       matrix:
         image: [mediamtx-ffmpeg, postgres-timeshift, azure-blob-services]
     uses: gks-composite/.github/.github/workflows/Docker-Build-Push.yml@main
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     with:
       image-name: ${{ matrix.image }}
       context: ${{ matrix.image }}
@@ -90,8 +110,7 @@ jobs:
 | `runs-on` | `ubuntu-latest` | Runner. |
 | `fetch-depth` | `0` | Checkout depth (0 for versioning). |
 
-`secrets.build-token` (optional) is used for registry login and as the `github_token` BuildKit
-secret; it falls back to `GITHUB_TOKEN`.
+There are **no secrets** to pass — the workflow uses `GITHUB_TOKEN` from the calling job.
 
 ## Tag scheme
 

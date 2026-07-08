@@ -22,6 +22,13 @@ concurrency:
 jobs:
   docker:
     uses: gks-composite/.github/.github/workflows/Docker-Build-Push.yml@main
+    # Uses the built-in GITHUB_TOKEN only (no PATs). Grant packages: write, and make
+    # sure this repo has access to the image package it pushes and to any internal
+    # dependency packages it restores (Org → Packages → package → Manage access).
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     with:
       # Required: the image name published to ghcr.io/<owner>/<image-name>
       image-name: CHANGE-ME
@@ -30,7 +37,3 @@ jobs:
       # target:            # optional build stage, e.g. runtime-server
       # platforms: linux/amd64
       environment-tag: ${{ github.event.inputs.environment-tag || '' }}
-    secrets:
-      # Optional. Needed only for private NuGet/npm restore inside the Dockerfile.
-      # Safe to leave as-is: an absent secret falls back to GITHUB_TOKEN.
-      build-token: ${{ secrets.GH_PACKAGETOKEN }}

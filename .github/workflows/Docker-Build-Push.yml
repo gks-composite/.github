@@ -14,6 +14,11 @@ name: Docker Build and Push
 #   pull_request                 -> fail on CRITICAL
 #   default branch / release tag -> fail on HIGH,CRITICAL   (hardened release)
 #   other branches               -> report only
+#
+# Auth: the built-in GITHUB_TOKEN only (no PATs). The calling job must grant
+# `packages: write`, and the repo must be granted access to the image package it
+# pushes and to any internal dependency packages it restores. There is no token
+# fallback on purpose -> the build fails loudly if package access is missing.
 # ============================================================================
 
 on:
@@ -113,10 +118,6 @@ on:
         required: false
         type: number
         default: 0
-    secrets:
-      build-token:
-        description: 'Token for registry login and the github_token BuildKit secret (e.g. a GH packages PAT). Falls back to GITHUB_TOKEN.'
-        required: false
     outputs:
       version:
         description: 'Resolved version used for tagging.'
@@ -232,7 +233,7 @@ jobs:
         with:
           registry: ${{ inputs.registry }}
           username: ${{ github.actor }}
-          password: ${{ secrets.build-token || secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Docker metadata
         id: meta
@@ -263,7 +264,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: ${{ inputs.build-args }}
           secrets: |
-            github_token=${{ secrets.build-token || secrets.GITHUB_TOKEN }}
+            github_token=${{ secrets.GITHUB_TOKEN }}
           cache-from: type=gha,scope=${{ inputs.image-name }}
           cache-to: type=gha,mode=max,scope=${{ inputs.image-name }}
 
@@ -294,7 +295,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: ${{ inputs.build-args }}
           secrets: |
-            github_token=${{ secrets.build-token || secrets.GITHUB_TOKEN }}
+            github_token=${{ secrets.GITHUB_TOKEN }}
           cache-from: type=gha,scope=${{ inputs.image-name }}
           cache-to: type=gha,mode=max,scope=${{ inputs.image-name }}
           sbom: ${{ inputs.sbom && steps.policy.outputs.release_tier == 'true' }}
