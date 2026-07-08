@@ -1,0 +1,36 @@
+name: Docker Build and Push
+
+on:
+  push:
+    branches:
+      - $default-branch
+      - $protected-branches
+  pull_request:
+    branches:
+      - $default-branch
+  workflow_dispatch:
+    inputs:
+      environment-tag:
+        description: 'Optional promotion tag to also apply (e.g. latest-qa, latest-prod)'
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker:
+    uses: gks-composite/.github/.github/workflows/Docker-Build-Push.yml@main
+    with:
+      # Required: the image name published to ghcr.io/<owner>/<image-name>
+      image-name: CHANGE-ME
+      context: .
+      dockerfile: Dockerfile
+      # target:            # optional build stage, e.g. runtime-server
+      # platforms: linux/amd64
+      environment-tag: ${{ github.event.inputs.environment-tag || '' }}
+    secrets:
+      # Optional. Needed only for private NuGet/npm restore inside the Dockerfile.
+      # Safe to leave as-is: an absent secret falls back to GITHUB_TOKEN.
+      build-token: ${{ secrets.GH_PACKAGETOKEN }}
