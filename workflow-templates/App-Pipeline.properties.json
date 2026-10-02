@@ -1,0 +1,7 @@
+{
+    "name": "App Pipeline (build, test, release, deploy)",
+    "description": "Standard FaceFirst app pipeline: global-version, reserved version tag, .NET build/test with NuGet audit, gitleaks + release-tier grype scanning, GHCR push, GitHub release, sbx deploy dispatch.",
+    "iconName": "",
+    "categories": ["deployment", "docker", "container", "dotnet"],
+    "filePatterns": ["Dockerfile$", ".*/Dockerfile$"]
+}

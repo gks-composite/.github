@@ -4,16 +4,21 @@ name: Docker Build and Push
 # Uniform Docker build/scan/tag/push pipeline for the GateKeeper enterprise.
 #
 #   version  -> gks-composite/global-version (falls back to 0.1.<run_number>)
-#   fs scan  -> Trivy filesystem scan of the build context (source + deps)
-#   build    -> single-arch load for scanning
-#   img scan -> Trivy image scan of the built image
-#   push     -> multi-tag push to GHCR (PRs push pr-<n>/sha- tags too)
+#   secrets  -> gitleaks scan of the checkout (diff-scoped on PRs, tree scan
+#               on pushes); fails on findings at EVERY tier. Allowlist test
+#               fixtures via a repo-root .gitleaks.toml.
+#   img scan -> grype vulnerability scan of the built image, RELEASE TIER ONLY
+#               (default branch / tags), fail on HIGH+CRITICAL. PRs get no
+#               image scan - that is deliberate (DEVO-223): keep PRs fast.
+#   push     -> multi-tag push to GHCR (PRs push pr-<n>/sha- tags too).
+#               Version-family tags (<version>, <major.minor>, <major>) apply
+#               ONLY on release-tier builds with apply-version-tags=true, so a
+#               PR/dev/dispatch build can never mint or move a version tag.
 #   harden   -> SBOM + provenance (+ optional cosign) on default-branch / tags
 #
-# Tiered scan gating:
-#   pull_request                 -> fail on CRITICAL
-#   default branch / release tag -> fail on HIGH,CRITICAL   (hardened release)
-#   other branches               -> report only
+# Trivy was removed 2026-10 (DEVO-223): slow DB pulls + full-context scans on
+# every PR. Dependency-level vulns are covered by NuGet/npm audit in the build
+# workflows and Dependabot alerts at the repo level.
 #
 # Auth: the built-in GITHUB_TOKEN only (no PATs). The calling job must grant
 # `packages: write`, and the repo must be granted access to the image package it
@@ -74,20 +79,29 @@ on:
         type: boolean
         default: true
       fs-scan:
-        description: 'Run a Trivy filesystem scan of the build context before building.'
+        description: 'Run a gitleaks secrets scan of the checkout (diff-scoped on PRs, tree scan on pushes).'
         required: false
         type: boolean
         default: true
       image-scan:
-        description: 'Run a Trivy scan of the built image before pushing.'
+        description: 'Run a grype vulnerability scan of the built image on release-tier builds (default branch / tags). PRs are never image-scanned.'
         required: false
         type: boolean
         default: true
       scan-ignore-unfixed:
-        description: 'Ignore vulnerabilities that have no fix yet.'
+        description: 'Only fail the image scan on vulnerabilities that have a fix available (grype only-fixed).'
         required: false
         type: boolean
         default: false
+      apply-version-tags:
+        description: >-
+          Apply the <version>, <major.minor> and <major> tags. Only honored on
+          release-tier builds; callers that reserve the git tag first (App-Pipeline)
+          pass the reservation result here so an unreserved build can never move a
+          version tag.
+        required: false
+        type: boolean
+        default: true
       sbom:
         description: 'Attach SBOM + provenance on release-tier pushes (default branch / tags).'
         required: false
@@ -108,6 +122,11 @@ on:
         required: false
         type: string
         default: 'main'
+      release-branch-prefix:
+        description: 'Branch prefix also treated as release tier (image scan + version tags), e.g. licenseserver release/v8.4.1. Empty disables.'
+        required: false
+        type: string
+        default: 'release/'
       runs-on:
         description: 'Runner label.'
         required: false
@@ -141,7 +160,6 @@ jobs:
       contents: read
       packages: write
       id-token: write
-      security-events: write
     outputs:
       version: ${{ steps.version.outputs.version }}
       image: ${{ steps.image.outputs.ref }}
@@ -188,8 +206,11 @@ jobs:
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
           echo "Image: $REF"
 
-      # ----- Scan policy (tiered) -----
-      - name: Determine scan + release policy
+      # ----- Tier policy -----
+      # Release tier = push to the default branch, a release/* branch, or a tag.
+      # (release/* was previously NOT release tier here, while the callers'
+      # header comments claimed it was - fixed as part of DEVO-223.)
+      - name: Determine release tier
         id: policy
         shell: bash
         run: |
@@ -197,30 +218,48 @@ jobs:
           RELEASE=false
           if [ "${{ github.ref }}" = "refs/heads/${{ inputs.default-branch }}" ] || [ "${{ github.ref_type }}" = "tag" ]; then
             RELEASE=true
+          elif [ -n "${{ inputs.release-branch-prefix }}" ] && [[ "${{ github.ref }}" == "refs/heads/${{ inputs.release-branch-prefix }}"* ]]; then
+            RELEASE=true
           fi
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            SEV="CRITICAL"; EXIT="1"
-          elif [ "$RELEASE" = "true" ]; then
-            SEV="HIGH,CRITICAL"; EXIT="1"
-          else
-            SEV="HIGH,CRITICAL"; EXIT="0"
+          VERSION_TAGS=false
+          if [ "$RELEASE" = "true" ] && [ "${{ inputs.apply-version-tags }}" = "true" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
+            VERSION_TAGS=true
           fi
-          echo "severity=$SEV" >> "$GITHUB_OUTPUT"
-          echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
           echo "release_tier=$RELEASE" >> "$GITHUB_OUTPUT"
-          echo "Scan tier: severity=$SEV exit-code=$EXIT release_tier=$RELEASE"
+          echo "version_tags=$VERSION_TAGS" >> "$GITHUB_OUTPUT"
+          echo "Tier: release_tier=$RELEASE version_tags=$VERSION_TAGS"
 
-      # ----- Source (filesystem) scan -----
-      - name: Trivy filesystem scan
+      # ----- Secrets scan (gitleaks; replaced the Trivy fs scan, DEVO-223) -----
+      - name: Install gitleaks
         if: ${{ inputs.fs-scan }}
-        uses: gks-composite/trivy-scan@v1
-        with:
-          scan-type: fs
-          scan-ref: ${{ inputs.context }}
-          severity: ${{ steps.policy.outputs.severity }}
-          exit-code: ${{ steps.policy.outputs.exit_code }}
-          ignore-unfixed: ${{ inputs.scan-ignore-unfixed }}
-          scanners: 'vuln,secret,misconfig'
+        shell: bash
+        env:
+          GITLEAKS_VERSION: '8.30.1'
+          GITLEAKS_SHA256: '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /tmp/gitleaks.tgz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tgz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+
+      - name: Secrets scan (gitleaks)
+        if: ${{ inputs.fs-scan }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Diff-scoped on PRs (checkout is fetch-depth 0 by default so the base
+          # exists; shallow checkouts fall back to a tree scan). Tree scan on
+          # pushes/dispatch. Findings fail the job at EVERY tier - allowlist
+          # test fixtures via a repo-root .gitleaks.toml, never by disabling.
+          if [ "${{ github.event_name }}" = "pull_request" ] \
+             && git cat-file -e "${{ github.event.pull_request.base.sha }}^{commit}" 2>/dev/null; then
+            /tmp/gitleaks git . \
+              --log-opts="${{ github.event.pull_request.base.sha }}..HEAD" \
+              --redact --no-banner --verbose
+          else
+            /tmp/gitleaks dir . --redact --no-banner --verbose
+          fi
 
       # ----- Build tooling -----
       - name: Set up QEMU
@@ -245,14 +284,18 @@ jobs:
             type=ref,event=branch
             type=ref,event=pr
             type=sha,prefix=sha-
-            type=raw,value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.version != '' }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }}
-            type=semver,pattern={{major}},value=${{ steps.version.outputs.version }}
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.version != '' && steps.policy.outputs.version_tags == 'true' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.version != '' && steps.policy.outputs.version_tags == 'true' }}
+            type=semver,pattern={{major}},value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.version != '' && steps.policy.outputs.version_tags == 'true' }}
             type=raw,value=${{ inputs.environment-tag }},enable=${{ inputs.environment-tag != '' }}
 
-      # ----- Build (single-arch, loaded for scanning) -----
-      - name: Build image for scan
+      # ----- Release-tier image build (loaded) + grype scan (replaced Trivy, DEVO-223) -----
+      # Runs BEFORE the push so latest/<version> can never point at an image that
+      # failed its scan. PRs skip both steps entirely - the push step below still
+      # builds from the same gha cache, so PRs lose only the scan time.
+      - name: Build image for release scan
         id: build
+        if: ${{ inputs.image-scan && steps.policy.outputs.release_tier == 'true' }}
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.context }}
@@ -268,17 +311,16 @@ jobs:
           cache-from: type=gha,scope=${{ inputs.image-name }}
           cache-to: type=gha,mode=max,scope=${{ inputs.image-name }}
 
-      # ----- Image scan -----
-      - name: Trivy image scan
-        if: ${{ inputs.image-scan }}
-        uses: gks-composite/trivy-scan@v1
+      - name: Grype image scan
+        if: ${{ inputs.image-scan && steps.policy.outputs.release_tier == 'true' }}
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
-          scan-type: image
-          scan-ref: local-scan:${{ github.run_id }}
-          severity: ${{ steps.policy.outputs.severity }}
-          exit-code: ${{ steps.policy.outputs.exit_code }}
-          ignore-unfixed: ${{ inputs.scan-ignore-unfixed }}
-          scanners: 'vuln,secret'
+          image: local-scan:${{ github.run_id }}
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: ${{ inputs.scan-ignore-unfixed }}
+          output-format: table
+          cache-db: true
 
       # ----- Push (real platforms, hardened on release tier) -----
       - name: Build & push image
@@ -324,7 +366,8 @@ jobs:
             echo "- **Image**: \`${{ steps.image.outputs.ref }}\`"
             echo "- **Version**: \`${{ steps.version.outputs.version }}\`"
             echo "- **Pushed**: \`${{ inputs.push }}\`  •  **Digest**: \`${{ steps.push.outputs.digest || 'n/a' }}\`"
-            echo "- **Scan tier**: severity \`${{ steps.policy.outputs.severity }}\`, exit-code \`${{ steps.policy.outputs.exit_code }}\`"
+            echo "- **Release tier**: \`${{ steps.policy.outputs.release_tier }}\`  •  **Version tags applied**: \`${{ steps.policy.outputs.version_tags }}\`"
+            echo "- **Secrets scan (gitleaks)**: \`${{ inputs.fs-scan }}\`  •  **Image scan (grype, release tier only)**: \`${{ inputs.image-scan && steps.policy.outputs.release_tier == 'true' }}\`"
             echo "- **Hardened (SBOM/provenance)**: \`${{ inputs.sbom && steps.policy.outputs.release_tier == 'true' }}\`"
             echo ""
             echo "### Tags"

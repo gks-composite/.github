@@ -1,7 +1,0 @@
-{
-    "name": "Global Lint (on pull request)",
-    "description": "Generic Global Linter for all repositories",
-    "iconName": "",
-    "categories": ["linting", "code-quality"],
-    "filePatterns": []
-}

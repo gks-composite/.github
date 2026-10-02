@@ -1,5 +1,19 @@
 name: Generic Global Scanner
 
+# ============================================================================
+# DEVO-223: Trivy removed enterprise-wide (slow DB pulls, heavy full-context
+# scans). This workflow keeps its call contract (working_dir, OVERRIDE_TOKEN)
+# but now runs a gitleaks SECRETS scan instead of the Trivy fs scan.
+#
+# It stays REPORT-ONLY by default to preserve existing callers' behavior (the
+# Trivy step always ran with exit-code 0). Pass fail-on-findings: true to make
+# leaked secrets fail the build - recommended once a repo has a .gitleaks.toml
+# allowlist for its test fixtures.
+#
+# Dependency/image vulnerability coverage moved to NuGet/npm audit in the build
+# pipelines, grype in Docker-Build-Push (release tier), and Dependabot alerts.
+# ============================================================================
+
 on:
   workflow_call:
     inputs:
@@ -8,6 +22,11 @@ on:
         required: false
         type: string
         default: "."
+      fail-on-findings:
+        description: 'Fail the job when gitleaks finds secrets (default false preserves the old report-only behavior).'
+        required: false
+        type: boolean
+        default: false
     secrets:
       OVERRIDE_TOKEN:
         required: false
@@ -17,7 +36,7 @@ jobs:
     permissions:
       packages: read
       statuses: write
-      contents: write
+      contents: read
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -28,10 +47,27 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
-      - name: Run Trivy Scan
-        uses: gks-composite/trivy-scan@v1
-        with:
-          scan-type: fs
-          working-dir: ${{ inputs.working_dir }}
-          severity: "HIGH,CRITICAL"
-          exit-code: "0"
+      - name: Install gitleaks
+        shell: bash
+        env:
+          GITLEAKS_VERSION: '8.30.1'
+          GITLEAKS_SHA256: '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /tmp/gitleaks.tgz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tgz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+
+      - name: Secrets scan (gitleaks)
+        shell: bash
+        working-directory: ${{ inputs.working_dir }}
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.fail-on-findings }}" = "true" ]; then
+            /tmp/gitleaks dir . --redact --no-banner --verbose
+          else
+            /tmp/gitleaks dir . --redact --no-banner --verbose || {
+              echo "::warning title=gitleaks::Potential secrets found (report-only; pass fail-on-findings: true to enforce)."
+            }
+          fi
