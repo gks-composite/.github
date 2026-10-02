@@ -243,23 +243,54 @@ jobs:
           echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tgz" | sha256sum -c -
           tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
 
+      # Findings are written to the job summary (visible from the PR's checks)
+      # rather than uploaded as SARIF: code scanning needs GitHub Advanced
+      # Security, which these private repos deliberately do not use. Every
+      # control in this pipeline is free/OSS and reports into the summary.
       - name: Secrets scan (gitleaks)
         if: ${{ inputs.fs-scan }}
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           # Diff-scoped on PRs (checkout is fetch-depth 0 by default so the base
           # exists; shallow checkouts fall back to a tree scan). Tree scan on
           # pushes/dispatch. Findings fail the job at EVERY tier - allowlist
           # test fixtures via a repo-root .gitleaks.toml, never by disabling.
           if [ "${{ github.event_name }}" = "pull_request" ] \
              && git cat-file -e "${{ github.event.pull_request.base.sha }}^{commit}" 2>/dev/null; then
+            SCOPE="PR diff (${{ github.event.pull_request.base.sha }}..HEAD)"
             /tmp/gitleaks git . \
               --log-opts="${{ github.event.pull_request.base.sha }}..HEAD" \
-              --redact --no-banner --verbose
+              --redact --no-banner --report-format json --report-path /tmp/gitleaks.json
           else
-            /tmp/gitleaks dir . --redact --no-banner --verbose
+            SCOPE="working tree"
+            /tmp/gitleaks dir . \
+              --redact --no-banner --report-format json --report-path /tmp/gitleaks.json
           fi
+          RC=$?
+
+          # --redact masks the matched value, so only rule + location are shown.
+          COUNT=$(jq 'length' /tmp/gitleaks.json 2>/dev/null || echo 0)
+          {
+            echo "### Secrets scan (gitleaks)"
+            echo ""
+            echo "Scope: ${SCOPE} · findings: **${COUNT}**"
+            if [ "${COUNT}" != "0" ]; then
+              echo ""
+              echo "| Rule | Location |"
+              echo "|---|---|"
+              jq -r '.[] | "| \(.RuleID) | `\(.File):\(.StartLine)` |"' /tmp/gitleaks.json | head -50
+              echo ""
+              echo "Values are redacted. If these are test fixtures or documented"
+              echo "local-dev defaults, allowlist the paths in a repo-root"
+              echo '`.gitleaks.toml` with the reason inline — do not disable the scan.'
+            else
+              echo ""
+              echo "No secrets detected."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit $RC
 
       # ----- Build tooling -----
       - name: Set up QEMU
@@ -311,16 +342,60 @@ jobs:
           cache-from: type=gha,scope=${{ inputs.image-name }}
           cache-to: type=gha,mode=max,scope=${{ inputs.image-name }}
 
+      # fail-build is false on purpose: the gate is applied in the next step so
+      # the findings reach the job summary on a FAILING run too. Severity policy
+      # is unchanged - HIGH and CRITICAL fail.
       - name: Grype image scan
+        id: grype
         if: ${{ inputs.image-scan && steps.policy.outputs.release_tier == 'true' }}
         uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           image: local-scan:${{ github.run_id }}
-          fail-build: true
+          fail-build: false
           severity-cutoff: high
           only-fixed: ${{ inputs.scan-ignore-unfixed }}
-          output-format: table
+          output-format: json
           cache-db: true
+
+      - name: Report image vulnerabilities
+        if: ${{ inputs.image-scan && steps.policy.outputs.release_tier == 'true' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          REPORT='${{ steps.grype.outputs.json }}'
+          if [ -z "$REPORT" ] || [ ! -f "$REPORT" ]; then
+            echo "::warning title=grype::No scan report produced; not gating on it."
+            echo "### Image vulnerabilities (grype)" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Scan produced no report — not gated." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          BLOCKING=$(jq '[.matches[]? | select(.vulnerability.severity == "High" or .vulnerability.severity == "Critical")] | length' "$REPORT")
+          TOTAL=$(jq '[.matches[]?] | length' "$REPORT")
+          {
+            echo "### Image vulnerabilities (grype)"
+            echo ""
+            echo "Image: \`${{ inputs.image-name }}\` · matches: **${TOTAL}** · High+Critical: **${BLOCKING}**"
+            if [ "${BLOCKING}" != "0" ]; then
+              echo ""
+              echo "| Severity | Package | Version | Fix | ID |"
+              echo "|---|---|---|---|---|"
+              jq -r '[.matches[]? | select(.vulnerability.severity == "High" or .vulnerability.severity == "Critical")]
+                     | sort_by(.vulnerability.severity)
+                     | .[]
+                     | "| \(.vulnerability.severity) | \(.artifact.name) | \(.artifact.version) | \(.vulnerability.fix.versions // [] | join(", ") | if . == "" then "none" else . end) | \(.vulnerability.id) |"' \
+                "$REPORT" | head -50
+            else
+              echo ""
+              echo "No High or Critical findings."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${BLOCKING}" != "0" ]; then
+            echo "::error title=grype::${BLOCKING} High/Critical vulnerabilities in the built image; see the job summary."
+            exit 1
+          fi
 
       # ----- Push (real platforms, hardened on release tier) -----
       - name: Build & push image

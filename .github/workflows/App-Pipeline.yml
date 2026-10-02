@@ -306,15 +306,47 @@ jobs:
       # warnings on every tier; on release-tier builds with enforcement on,
       # HIGH (NU1903) and CRITICAL (NU1904) fail the restore. Accepted
       # advisories belong in NuGetAuditSuppress items, not in turning this off.
+      # Advisories are reported into the job summary (visible from the PR's
+      # checks) as well as the usual MSBuild warnings. Code scanning / SARIF is
+      # not used: it needs GitHub Advanced Security, which these private repos
+      # deliberately do not use - every control here is free/OSS.
       - name: Restore (NuGet audit)
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           AUDIT_ARGS=("-p:NuGetAuditMode=all")
+          ENFORCED=no
           if [ "${{ steps.tier.outputs.release_tier }}" = "true" ] && [ "${{ inputs.nuget-audit-enforce }}" = "true" ]; then
             AUDIT_ARGS+=("-warnaserror:NU1903,NU1904")
+            ENFORCED=yes
           fi
-          dotnet restore ${{ inputs.build-target }} "${AUDIT_ARGS[@]}"
+          dotnet restore ${{ inputs.build-target }} "${AUDIT_ARGS[@]}" 2>&1 | tee /tmp/restore.log
+          RC=${PIPESTATUS[0]}
+
+          # NU1901 low / NU1902 moderate / NU1903 high / NU1904 critical.
+          mapfile -t ADV < <(grep -oE 'NU190[1-4]: Package .*' /tmp/restore.log | sort -u)
+          {
+            echo "### Dependency audit (NuGet)"
+            echo ""
+            echo "Advisories: **${#ADV[@]}** · High/Critical enforced on this run: **${ENFORCED}**"
+            if [ "${#ADV[@]}" != "0" ]; then
+              echo ""
+              echo '```'
+              printf '%s\n' "${ADV[@]}" | head -40
+              echo '```'
+              if [ "${ENFORCED}" = "no" ]; then
+                echo ""
+                echo "Not gated here: either this is not a release-tier build, or"
+                echo '`nuget-audit-enforce: false` is set by the caller. Accepted'
+                echo 'advisories belong in `NuGetAuditSuppress` items.'
+              fi
+            else
+              echo ""
+              echo "No known-vulnerable packages."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit $RC
 
       - name: Build
         shell: bash
@@ -431,10 +463,43 @@ jobs:
         working-directory: ${{ inputs.node-workdir }}
         run: npm ci
 
+      # Report-only on PRs, enforced on pushes. Results go to the job summary;
+      # SARIF/code scanning is not used (needs GitHub Advanced Security, which
+      # these private repos deliberately do not use).
       - name: npm audit
         working-directory: ${{ inputs.node-workdir }}
         continue-on-error: ${{ github.event_name == 'pull_request' }}
-        run: npm audit --audit-level=${{ inputs.npm-audit-level }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          npm audit --audit-level=${{ inputs.npm-audit-level }} --json > /tmp/npm-audit.json 2>/dev/null
+          RC=$?
+          {
+            echo "### Dependency audit (npm — ${{ inputs.node-workdir }})"
+            echo ""
+            if [ -s /tmp/npm-audit.json ]; then
+              jq -r '.metadata.vulnerabilities
+                     | "Severity counts: critical **\(.critical)** · high **\(.high)** · moderate **\(.moderate)** · low **\(.low)**"' \
+                /tmp/npm-audit.json 2>/dev/null || echo "Could not parse the audit report."
+              COUNT=$(jq '[.vulnerabilities[]? | select(.severity == "high" or .severity == "critical")] | length' /tmp/npm-audit.json 2>/dev/null || echo 0)
+              if [ "${COUNT}" != "0" ]; then
+                echo ""
+                echo "| Severity | Package | Via |"
+                echo "|---|---|---|"
+                jq -r '[.vulnerabilities[]? | select(.severity == "high" or .severity == "critical")]
+                       | .[]
+                       | "| \(.severity) | \(.name) | \([.via[]? | if type == "object" then .title else . end] | join("; ") | .[0:80]) |"' \
+                  /tmp/npm-audit.json | head -30
+              fi
+            else
+              echo "No audit report produced."
+            fi
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              echo ""
+              echo "_Report-only on pull requests; enforced at \`--audit-level=${{ inputs.npm-audit-level }}\` on pushes._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $RC
 
       - name: Build
         working-directory: ${{ inputs.node-workdir }}
