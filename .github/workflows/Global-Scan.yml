@@ -66,10 +66,14 @@ jobs:
         shell: bash
         working-directory: ${{ inputs.working_dir }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
+          # -e is on: GitHub runs bash as `bash -eo pipefail` whatever this line says.
+          # Exits that are EXPECTED to be non-zero are captured with `|| RC=$?`, and
+          # truncation uses awk rather than head, so an early-closing reader cannot
+          # SIGPIPE the producer under pipefail.
+          RC=0
           /tmp/gitleaks dir . --redact --no-banner \
-            --report-format json --report-path /tmp/gitleaks.json
-          RC=$?
+            --report-format json --report-path /tmp/gitleaks.json || RC=$?
 
           # --redact masks the matched value, so only rule + location are shown.
           COUNT=$(jq 'length' /tmp/gitleaks.json 2>/dev/null || echo 0)
@@ -81,7 +85,7 @@ jobs:
               echo ""
               echo "| Rule | Location |"
               echo "|---|---|"
-              jq -r '.[] | "| \(.RuleID) | `\(.File):\(.StartLine)` |"' /tmp/gitleaks.json | head -50
+              jq -r '.[] | "| \(.RuleID) | `\(.File):\(.StartLine)` |"' /tmp/gitleaks.json | awk 'NR<=50'
               echo ""
               echo 'Values are redacted. Allowlist test fixtures and documented'
               echo 'local-dev defaults in a repo-root `.gitleaks.toml`.'

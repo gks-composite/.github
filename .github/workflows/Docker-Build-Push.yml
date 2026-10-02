@@ -265,7 +265,11 @@ jobs:
         shell: bash
         working-directory: ${{ inputs.context }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
+          # -e is on: GitHub runs bash as `bash -eo pipefail` whatever this line says.
+          # Exits that are EXPECTED to be non-zero are captured with `|| RC=$?`, and
+          # truncation uses awk rather than head, so an early-closing reader cannot
+          # SIGPIPE the producer under pipefail.
           # Scoped to the build context, matching the scan-ref the Trivy fs step
           # used - a repo that builds several images keeps scanning only the
           # subdirectory each build owns.
@@ -283,18 +287,18 @@ jobs:
           if [ ! -f .gitleaks.toml ] && [ -f "$GITHUB_WORKSPACE/.gitleaks.toml" ]; then
             CFG=(--config "$GITHUB_WORKSPACE/.gitleaks.toml")
           fi
+          RC=0
           if [ "${{ github.event_name }}" = "pull_request" ] \
              && git cat-file -e "${{ github.event.pull_request.base.sha }}^{commit}" 2>/dev/null; then
             SCOPE="PR diff (${{ github.event.pull_request.base.sha }}..HEAD)"
             /tmp/gitleaks git . ${CFG[@]+"${CFG[@]}"} \
               --log-opts="${{ github.event.pull_request.base.sha }}..HEAD -- ." \
-              --redact --no-banner --report-format json --report-path /tmp/gitleaks.json
+              --redact --no-banner --report-format json --report-path /tmp/gitleaks.json || RC=$?
           else
             SCOPE="working tree"
             /tmp/gitleaks dir . ${CFG[@]+"${CFG[@]}"} \
-              --redact --no-banner --report-format json --report-path /tmp/gitleaks.json
+              --redact --no-banner --report-format json --report-path /tmp/gitleaks.json || RC=$?
           fi
-          RC=$?
 
           # --redact masks the matched value, so only rule + location are shown.
           COUNT=$(jq 'length' /tmp/gitleaks.json 2>/dev/null || echo 0)
@@ -306,7 +310,7 @@ jobs:
               echo ""
               echo "| Rule | Location |"
               echo "|---|---|"
-              jq -r '.[] | "| \(.RuleID) | `\(.File):\(.StartLine)` |"' /tmp/gitleaks.json | head -50
+              jq -r '.[] | "| \(.RuleID) | `\(.File):\(.StartLine)` |"' /tmp/gitleaks.json | awk 'NR<=50'
               echo ""
               echo "Values are redacted. If these are test fixtures or documented"
               echo "local-dev defaults, allowlist the paths in a repo-root"
@@ -405,7 +409,11 @@ jobs:
           IGNORE_UNFIXED: ${{ inputs.scan-ignore-unfixed }}
           IMAGE: ${{ inputs.image-name }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
+          # -e is on: GitHub runs bash as `bash -eo pipefail` whatever this line says.
+          # Exits that are EXPECTED to be non-zero are captured with `|| RC=$?`, and
+          # truncation uses awk rather than head, so an early-closing reader cannot
+          # SIGPIPE the producer under pipefail.
           if [ -z "$REPORT" ] || [ ! -f "$REPORT" ]; then
             echo "::error title=grype::The scan produced no report, so the image was not checked. Failing closed."
             { echo "### Image vulnerabilities (grype)"; echo ""; echo "**The scan produced no report - failing closed.**"; } >> "$GITHUB_STEP_SUMMARY"
@@ -449,7 +457,7 @@ jobs:
             echo ""
             if [ "$BLOCKING" != "0" ]; then
               table_header
-              qr '[.matches[]? | select(blocking($iu))] | sort_by(.vulnerability.severity) | .[] | row' | sort -u | head -50
+              qr '[.matches[]? | select(blocking($iu))] | sort_by(.vulnerability.severity) | .[] | row' | sort -u | awk 'NR<=50'
             else
               echo "No blocking findings."
             fi
@@ -458,7 +466,7 @@ jobs:
               echo "<details><summary>Accepted risk: ${ACCEPTED} match(es) suppressed by the repo's <code>.grype.yaml</code></summary>"
               echo ""
               table_header
-              qr '.ignoredMatches[]? | row' | sort -u | head -30
+              qr '.ignoredMatches[]? | row' | sort -u | awk 'NR<=30'
               echo ""
               echo "</details>"
             fi
@@ -471,7 +479,7 @@ jobs:
               fi
               echo ""
               table_header
-              qr '.matches[]? | select(hc and (heuristic | not) and (fixed | not)) | row' | sort -u | head -30
+              qr '.matches[]? | select(hc and (heuristic | not) and (fixed | not)) | row' | sort -u | awk 'NR<=30'
               echo ""
               echo "</details>"
             fi
