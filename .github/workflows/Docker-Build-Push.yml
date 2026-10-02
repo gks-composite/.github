@@ -273,15 +273,25 @@ jobs:
           # exists; shallow checkouts fall back to a tree scan). Tree scan on
           # pushes/dispatch. Findings fail the job at EVERY tier - allowlist
           # test fixtures via a repo-root .gitleaks.toml, never by disabling.
+          #
+          # gitleaks auto-loads .gitleaks.toml only from the directory it scans,
+          # i.e. the build context. For a context below the repo root, fall back
+          # to the repo-root file so one allowlist covers every image; without
+          # this a repo-root allowlist is silently ignored for subdirectory
+          # contexts. A context-local .gitleaks.toml still wins.
+          CFG=()
+          if [ ! -f .gitleaks.toml ] && [ -f "$GITHUB_WORKSPACE/.gitleaks.toml" ]; then
+            CFG=(--config "$GITHUB_WORKSPACE/.gitleaks.toml")
+          fi
           if [ "${{ github.event_name }}" = "pull_request" ] \
              && git cat-file -e "${{ github.event.pull_request.base.sha }}^{commit}" 2>/dev/null; then
             SCOPE="PR diff (${{ github.event.pull_request.base.sha }}..HEAD)"
-            /tmp/gitleaks git . \
+            /tmp/gitleaks git . ${CFG[@]+"${CFG[@]}"} \
               --log-opts="${{ github.event.pull_request.base.sha }}..HEAD -- ." \
               --redact --no-banner --report-format json --report-path /tmp/gitleaks.json
           else
             SCOPE="working tree"
-            /tmp/gitleaks dir . \
+            /tmp/gitleaks dir . ${CFG[@]+"${CFG[@]}"} \
               --redact --no-banner --report-format json --report-path /tmp/gitleaks.json
           fi
           RC=$?
