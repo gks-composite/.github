@@ -4,9 +4,9 @@ Uniform container pipeline for the GateKeeper enterprise. One reusable workflow 
 repository the same behaviour:
 
 1. **Version** — computed by [`gks-composite/global-version`](https://github.com/gks-composite/global-version) from `v*` git tags (falls back to `0.1.<run_number>` for un-tagged repos).
-2. **Source scan** — Trivy filesystem scan of the build context (vuln + secret + misconfig).
+2. **Secrets scan** — gitleaks scan of the checkout (diff-scoped on PRs, tree scan on pushes); fails on findings at every tier.
 3. **Build** — a single-arch image is built and loaded for scanning.
-4. **Image scan** — Trivy scan of the built image.
+4. **Image scan** — grype scan of the built image, release tier only (default branch / release/* / tags), fail on HIGH+CRITICAL.
 5. **Push** — multi-tag push to GHCR. Pull requests also push with identifiable `pr-<n>` / `sha-<sha>` tags.
 6. **Harden** — SBOM + provenance attestations (and optional cosign signing) on default-branch / release-tag builds.
 
@@ -101,7 +101,7 @@ jobs:
 | `registry` | `ghcr.io` | Registry host. |
 | `image-namespace` | *(owner)* | Registry namespace (lowercased). |
 | `push` | `true` | Push (set false for build + scan only). |
-| `fs-scan` / `image-scan` | `true` | Toggle each Trivy scan. |
+| `fs-scan` / `image-scan` | `true` | Toggle the gitleaks secrets scan / release-tier grype image scan. |
 | `scan-ignore-unfixed` | `false` | Ignore vulns with no fix. |
 | `sbom` | `true` | SBOM + provenance on release-tier pushes. |
 | `sign` | `false` | Cosign keyless sign on release-tier pushes. |

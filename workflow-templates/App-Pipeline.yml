@@ -1,0 +1,42 @@
+name: Build, Test and Deploy
+
+# Thin caller for the standard FaceFirst app pipeline (DEVO-223):
+# version -> reserve tag -> build/test -> image build+scan+push -> GitHub
+# release -> sbx deploy dispatch. Pipeline changes happen in
+# gks-composite/.github, not here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment_tag:
+        description: 'Optional promotion tag to also apply (e.g. latest-qa)'
+        required: false
+        type: string
+  push:
+    branches:
+      - $default-branch
+      - 'release/**'
+  pull_request:
+    branches:
+      - $default-branch
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: write   # reserve tag + release
+  packages: write   # GHCR push
+
+jobs:
+  pipeline:
+    uses: gks-composite/.github/.github/workflows/App-Pipeline.yml@main
+    secrets: inherit
+    with:
+      # build-target: '.'
+      # test-projects: |
+      #   My.App.Tests/My.App.Tests.csproj
+      images: '[{"name":"my-image","dockerfile":"Dockerfile"}]'
+      environment-tag: ${{ github.event.inputs.environment_tag || '' }}
+      # deploy-sbx: true
+      # deploy-app-key: 'identity'   # ff:apps key in ff-cloud-services

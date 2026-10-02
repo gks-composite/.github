@@ -1,0 +1,642 @@
+name: App Pipeline
+
+# ============================================================================
+# The standard FaceFirst app pipeline (DEVO-223).
+#
+#   version    -> gks-composite/global-version (vX.Y.Z[.W] git tags -> next)
+#   reserve    -> create git tag v<version> (push to main/release/* only).
+#                 Atomic: a concurrent duplicate 422s and the run fails BEFORE
+#                 anything is built, so a published version tag can never move.
+#   build-test -> .NET restore (NuGet audit) / build / test (+ optional Azurite,
+#                 optional docs-assets artifact)
+#   node-build -> optional npm ci + audit + build (e.g. licenseserver clientapp)
+#   docker     -> matrix over `images` -> Docker-Build-Push (gitleaks secrets
+#                 scan; grype image scan + version tags on release tier only)
+#   release    -> GitHub Release on the reserved tag, AFTER the image push
+#   deploy-sbx -> dispatch gks-infra/ff-cloud-services deploy-app.yml with the
+#                 concrete <version> image tag (sbx App Services re-pull only
+#                 on a config change - :latest re-pushes deploy nothing)
+#
+# App repos are THIN CALLERS: triggers + one `uses:` + genuinely bespoke jobs.
+# Pipeline changes happen here, once, without touching app repos.
+#
+# PR runs: version + build-test + node-build + docker only (PR images are still
+# pushed with pr-<n>/sha- tags; no version tags, no release, no deploy).
+#
+# Callers must grant the calling job:
+#
+#     pipeline:
+#       permissions:
+#         contents: write   # reserve the version tag + create the release
+#         packages: write   # GHCR push (implies the read that NuGet restore needs)
+#         id-token: write   # buildx provenance/SBOM attestations
+#       uses: gks-composite/.github/.github/workflows/App-Pipeline.yml@main
+#       secrets: inherit
+#
+# These go on the JOB, not only on the workflow: a called workflow's jobs can
+# never hold more than the calling job was granted, and a workflow-level block
+# that omits id-token makes the nested `docker` job a startup failure
+# ("requesting 'id-token: write', but is only allowed 'id-token: none'").
+# `secrets: inherit` is what carries org var GKS_INFRA_DISPATCH_APP_ID + org
+# secret GKS_INFRA_DISPATCH_APP_PRIVATE_KEY through to the sbx dispatch.
+# ============================================================================
+
+on:
+  workflow_call:
+    inputs:
+      # ----- version -----
+      version:
+        description: 'Explicit version override (no leading v). Empty = compute via gks-composite/global-version.'
+        required: false
+        type: string
+        default: ''
+      default-branch:
+        description: 'Trunk branch (versioning, latest tag, release, deploy).'
+        required: false
+        type: string
+        default: 'main'
+      release-branch-prefix:
+        description: 'Branch prefix also treated as release tier (reserve + release, no deploy).'
+        required: false
+        type: string
+        default: 'release/'
+      reserve-version-tag:
+        description: 'Reserve the v<version> git tag at pipeline start on release-tier pushes.'
+        required: false
+        type: boolean
+        default: true
+      # ----- .NET build/test -----
+      dotnet-version:
+        required: false
+        type: string
+        default: '10.0.x'
+      configuration:
+        required: false
+        type: string
+        default: 'Release'
+      build-target:
+        description: 'Solution dir, .sln(x) or .csproj passed to restore/build.'
+        required: false
+        type: string
+        default: '.'
+      build-props:
+        description: 'Extra MSBuild args appended to the build (the four -p:*Version props are always passed).'
+        required: false
+        type: string
+        default: ''
+      test-projects:
+        description: >-
+          '' = skip tests entirely (repo has none). '.' = one solution-wide
+          `dotnet test --no-build` on build-target. Otherwise a newline list of
+          "<csproj> [extra args]" each run as `dotnet test --project <csproj>
+          <extra> --configuration <cfg> --report-trx --report-github --coverage
+          --coverage-output-format cobertura --no-ansi` (the MTP v2 idiom; the
+          VSTest --filter/--logger flags break MTP - see repo CLAUDE.md files).
+        required: false
+        type: string
+        default: ''
+      start-azurite:
+        description: 'Start an Azurite blob service on 127.0.0.1:10000 before tests (fail-loud wait).'
+        required: false
+        type: boolean
+        default: false
+      nuget-source:
+        description: 'Internal NuGet feed authenticated with GITHUB_TOKEN. Empty skips auth.'
+        required: false
+        type: string
+        default: 'https://nuget.pkg.github.com/facefirst-engineering/index.json'
+      nuget-audit-enforce:
+        description: 'On release-tier builds, fail restore on known HIGH/CRITICAL advisories (NU1903/NU1904).'
+        required: false
+        type: boolean
+        default: true
+      docs-assets-command:
+        description: >-
+          Optional shell run after tests on pushes to the default branch
+          (continue-on-error): generate docs assets into ./docs-assets. Uploaded
+          as the docs-assets artifact only when non-empty, for the docs deploy
+          to fold in (DEVO-223 docs scoping).
+        required: false
+        type: string
+        default: ''
+      docs-assets-artifact:
+        required: false
+        type: string
+        default: 'docs-assets'
+      # ----- optional node job -----
+      node-workdir:
+        description: 'Directory with a package.json to npm ci + audit + build. Empty disables the job.'
+        required: false
+        type: string
+        default: ''
+      node-version:
+        required: false
+        type: string
+        default: '20'
+      node-build-command:
+        required: false
+        type: string
+        default: 'npm run build'
+      npm-audit-level:
+        description: 'npm audit level; report-only on PRs, enforced on release-tier pushes.'
+        required: false
+        type: string
+        default: 'high'
+      npm-audit-enforce:
+        description: >-
+          Fail release-tier builds on advisories at or above npm-audit-level.
+          Set false (with the advisories named in the caller) when a repo has a
+          known backlog it cannot clear yet - the findings still go to the job
+          summary, they just stop blocking the build.
+        required: false
+        type: boolean
+        default: true
+      # ----- images -----
+      images:
+        description: >-
+          JSON array of images to build/push:
+          [{"name":"adminapi","dockerfile":"Dockerfile","target":"runtime-admin","context":".","build-args":"K=V"}]
+        required: true
+        type: string
+      environment-tag:
+        description: 'Optional extra raw tag (e.g. latest-qa) for promotion.'
+        required: false
+        type: string
+        default: ''
+      secret-scan:
+        required: false
+        type: boolean
+        default: true
+      image-scan:
+        required: false
+        type: boolean
+        default: true
+      scan-ignore-unfixed:
+        required: false
+        type: boolean
+        default: false
+      # ----- release -----
+      release:
+        description: 'Create the GitHub Release (on the reserved tag) after the image push.'
+        required: false
+        type: boolean
+        default: true
+      release-artifacts:
+        description: 'Newline-separated artifact name patterns to download and attach to the release.'
+        required: false
+        type: string
+        default: ''
+      release-draft:
+        required: false
+        type: boolean
+        default: false
+      # ----- sbx deploy dispatch -----
+      deploy-sbx:
+        description: 'After the release, dispatch an sbx deploy to ff-cloud-services (single-image repos; multi-image repos do this repo-side).'
+        required: false
+        type: boolean
+        default: false
+      deploy-app-key:
+        description: 'ff:apps key in ff-cloud-services (identity | notifications | licenseApi | licenseAdmin).'
+        required: false
+        type: string
+        default: ''
+      deploy-wait-for:
+        description: 'Optional health URL the receiver polls after the deploy (non-fatal).'
+        required: false
+        type: string
+        default: ''
+      deploy-stack:
+        required: false
+        type: string
+        default: 'sbx'
+      deploy-repo:
+        required: false
+        type: string
+        default: 'gks-infra/ff-cloud-services'
+      deploy-workflow:
+        required: false
+        type: string
+        default: 'deploy-app.yml'
+      deploy-wait:
+        description: 'Wait for the dispatched deploy run and fail this pipeline if it fails.'
+        required: false
+        type: boolean
+        default: true
+      runs-on:
+        required: false
+        type: string
+        default: 'ubuntu-latest'
+    outputs:
+      version:
+        description: 'Resolved version.'
+        value: ${{ jobs.version.outputs.version }}
+      image:
+        description: 'Fully-qualified lowercase image ref without tag (last matrix leg - meaningful for single-image repos).'
+        value: ${{ jobs.docker.outputs.image }}
+      digest:
+        description: 'Pushed image digest (last matrix leg).'
+        value: ${{ jobs.docker.outputs.digest }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Version - uniform enterprise standard (echoes the override back when given).
+  # ---------------------------------------------------------------------------
+  version:
+    uses: gks-composite/.github/.github/workflows/Global-Version.yml@main
+    secrets: inherit
+    with:
+      version: ${{ inputs.version }}
+      defaultBranch: ${{ inputs.default-branch }}
+
+  # ---------------------------------------------------------------------------
+  # Reserve the version tag (DEVO-223 versioner integrity).
+  # Runs ONLY on pushes to the default branch or release/* branches. Atomic:
+  # if the tag already exists this fails (422) before anything builds - a
+  # concurrent run or a same-version rebuild can therefore never re-point a
+  # published version. A failed run after this leaves a tag with no release:
+  # a burned number, never a collision; the next push bumps past it.
+  # Tag pushes made with GITHUB_TOKEN do not trigger workflows.
+  # ---------------------------------------------------------------------------
+  reserve:
+    name: Reserve v${{ needs.version.outputs.version }}
+    runs-on: ${{ inputs.runs-on }}
+    needs: version
+    if: >-
+      inputs.reserve-version-tag && github.event_name == 'push' &&
+      (github.ref == format('refs/heads/{0}', inputs.default-branch) ||
+       startsWith(github.ref, format('refs/heads/{0}', inputs.release-branch-prefix)))
+    permissions:
+      contents: write
+    steps:
+      - name: Create tag ref
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/${{ github.repository }}/git/refs" \
+               -f ref="refs/tags/v${V}" -f sha="${{ github.sha }}"; then
+            echo "Reserved v${V} at ${{ github.sha }}"
+          else
+            echo "::error title=Version tag exists::v${V} already exists - a concurrent run reserved it, or this is a rebuild at an already-published version. Re-run to compute the next version, or pass an explicit 'version' input (discouraged: that is a tag move)."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # .NET build + test (+ optional Azurite, NuGet audit, docs-assets artifact)
+  # ---------------------------------------------------------------------------
+  build-test:
+    name: Build & Test
+    runs-on: ${{ inputs.runs-on }}
+    needs: version
+    # packages:read is load-bearing: restore pulls FaceFirst.* from
+    # nuget.pkg.github.com, and fcmproxy's packageSourceMapping routes that
+    # prefix there with no fallback. The workflow-level default (contents:read)
+    # would set packages:none and 401 the restore.
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Configure NuGet authentication
+        if: ${{ inputs.nuget-source != '' }}
+        uses: gks-composite/nuget-auth@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          source-url: ${{ inputs.nuget-source }}
+
+      - name: Determine release tier
+        id: tier
+        shell: bash
+        run: |
+          set -euo pipefail
+          RELEASE=false
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            if [ "${{ github.ref }}" = "refs/heads/${{ inputs.default-branch }}" ] \
+               || [[ "${{ github.ref }}" == "refs/heads/${{ inputs.release-branch-prefix }}"* ]]; then
+              RELEASE=true
+            fi
+          fi
+          echo "release_tier=$RELEASE" >> "$GITHUB_OUTPUT"
+
+      # NuGet audit rides the restore: NU1901-NU1904 advisories surface as
+      # warnings on every tier; on release-tier builds with enforcement on,
+      # HIGH (NU1903) and CRITICAL (NU1904) fail the restore. Accepted
+      # advisories belong in NuGetAuditSuppress items, not in turning this off.
+      # Advisories are reported into the job summary (visible from the PR's
+      # checks) as well as the usual MSBuild warnings. Code scanning / SARIF is
+      # not used: it needs GitHub Advanced Security, which these private repos
+      # deliberately do not use - every control here is free/OSS.
+      - name: Restore (NuGet audit)
+        shell: bash
+        run: |
+          set -uo pipefail
+          AUDIT_ARGS=("-p:NuGetAuditMode=all")
+          ENFORCED=no
+          if [ "${{ steps.tier.outputs.release_tier }}" = "true" ] && [ "${{ inputs.nuget-audit-enforce }}" = "true" ]; then
+            AUDIT_ARGS+=("-warnaserror:NU1903,NU1904")
+            ENFORCED=yes
+          fi
+          dotnet restore ${{ inputs.build-target }} "${AUDIT_ARGS[@]}" 2>&1 | tee /tmp/restore.log
+          RC=${PIPESTATUS[0]}
+
+          # NU1901 low / NU1902 moderate / NU1903 high / NU1904 critical.
+          mapfile -t ADV < <(grep -oE 'NU190[1-4]: Package .*' /tmp/restore.log | sort -u)
+          {
+            echo "### Dependency audit (NuGet)"
+            echo ""
+            echo "Advisories: **${#ADV[@]}** · High/Critical enforced on this run: **${ENFORCED}**"
+            if [ "${#ADV[@]}" != "0" ]; then
+              echo ""
+              echo '```'
+              printf '%s\n' "${ADV[@]}" | head -40
+              echo '```'
+              if [ "${ENFORCED}" = "no" ]; then
+                echo ""
+                echo "Not gated here: either this is not a release-tier build, or"
+                echo '`nuget-audit-enforce: false` is set by the caller. Accepted'
+                echo 'advisories belong in `NuGetAuditSuppress` items.'
+              fi
+            else
+              echo ""
+              echo "No known-vulnerable packages."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit $RC
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet build ${{ inputs.build-target }} \
+            --configuration ${{ inputs.configuration }} \
+            --no-restore \
+            -p:Version=${{ needs.version.outputs.version }} \
+            -p:AssemblyVersion=${{ needs.version.outputs.version }} \
+            -p:FileVersion=${{ needs.version.outputs.version }} \
+            -p:InformationalVersion=${{ needs.version.outputs.version }} \
+            ${{ inputs.build-props }}
+
+      # Azurite as a plain container (a reusable workflow cannot take job-level
+      # `services:` from an input). Fail-loud wait lifted from packageserver:
+      # a silent self-skip of storage tests is the failure mode this prevents.
+      - name: Start Azurite
+        if: ${{ inputs.start-azurite }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name azurite -p 10000:10000 mcr.microsoft.com/azure-storage/azurite:3.37.0
+          for _ in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/127.0.0.1/10000) 2>/dev/null; then
+              echo "Azurite is accepting connections on 127.0.0.1:10000."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error title=Azurite::No listener on 127.0.0.1:10000 after 30s; storage tests would silently self-skip."
+          exit 1
+
+      - name: Test
+        if: ${{ inputs.test-projects != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.test-projects }}" = "." ]; then
+            dotnet test ${{ inputs.build-target }} --configuration ${{ inputs.configuration }} --no-build
+          else
+            # noglob: each line word-splits into "<csproj> [extra args]", but a
+            # filter pattern like '*Integration*' must reach dotnet verbatim -
+            # without this bash expands it against the repo root.
+            set -f
+            while IFS= read -r line; do
+              if [ -z "${line// }" ]; then continue; fi
+              # shellcheck disable=SC2086 - the line deliberately word-splits into "<csproj> [extra args]"
+              dotnet test --project $line \
+                --configuration ${{ inputs.configuration }} \
+                --report-trx --report-github \
+                --coverage --coverage-output-format cobertura \
+                --no-ansi
+            done <<'EOF'
+          ${{ inputs.test-projects }}
+          EOF
+          fi
+
+      - name: Upload test results
+        if: ${{ !cancelled() && inputs.test-projects != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            **/TestResults/**/*.trx
+            **/TestResults/**/*.cobertura.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # Docs assets (DEVO-223 docs scoping): generated on default-branch pushes
+      # only, best-effort, and uploaded ONLY when non-empty so a failed
+      # generation never shadows the last good artifact.
+      - name: Generate docs assets
+        if: ${{ inputs.docs-assets-command != '' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', inputs.default-branch) }}
+        continue-on-error: true
+        shell: bash
+        run: ${{ inputs.docs-assets-command }}
+
+      - name: Check docs assets
+        id: docsassets
+        if: ${{ inputs.docs-assets-command != '' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', inputs.default-branch) }}
+        shell: bash
+        run: |
+          if [ -d docs-assets ] && [ -n "$(find docs-assets -type f -print -quit)" ]; then
+            echo "upload=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "upload=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::docs-assets is empty - keeping the previous artifact."
+          fi
+
+      - name: Upload docs assets
+        if: ${{ steps.docsassets.outputs.upload == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.docs-assets-artifact }}
+          path: docs-assets/
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # Optional node build (React SPA etc.)
+  # ---------------------------------------------------------------------------
+  node-build:
+    name: Node build (${{ inputs.node-workdir }})
+    runs-on: ${{ inputs.runs-on }}
+    if: ${{ inputs.node-workdir != '' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+          cache-dependency-path: ${{ inputs.node-workdir }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.node-workdir }}
+        run: npm ci
+
+      # Report-only on PRs, enforced on pushes. Results go to the job summary;
+      # SARIF/code scanning is not used (needs GitHub Advanced Security, which
+      # these private repos deliberately do not use).
+      - name: npm audit
+        working-directory: ${{ inputs.node-workdir }}
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          npm audit --audit-level=${{ inputs.npm-audit-level }} --json > /tmp/npm-audit.json 2>/dev/null
+          RC=$?
+          {
+            echo "### Dependency audit (npm — ${{ inputs.node-workdir }})"
+            echo ""
+            if [ -s /tmp/npm-audit.json ]; then
+              jq -r '.metadata.vulnerabilities
+                     | "Severity counts: critical **\(.critical)** · high **\(.high)** · moderate **\(.moderate)** · low **\(.low)**"' \
+                /tmp/npm-audit.json 2>/dev/null || echo "Could not parse the audit report."
+              COUNT=$(jq '[.vulnerabilities[]? | select(.severity == "high" or .severity == "critical")] | length' /tmp/npm-audit.json 2>/dev/null || echo 0)
+              if [ "${COUNT}" != "0" ]; then
+                echo ""
+                echo "| Severity | Package | Via |"
+                echo "|---|---|---|"
+                jq -r '[.vulnerabilities[]? | select(.severity == "high" or .severity == "critical")]
+                       | .[]
+                       | "| \(.severity) | \(.name) | \([.via[]? | if type == "object" then .title else . end] | join("; ") | .[0:80]) |"' \
+                  /tmp/npm-audit.json | head -30
+              fi
+            else
+              echo "No audit report produced."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Enforcement tier, matching the documented contract: report-only on
+          # pull requests, enforced on default-branch / release-branch pushes.
+          # Previously this was a bare `exit $RC`, which failed PRs too.
+          ENFORCE=false
+          if [ "${{ github.event_name }}" != "pull_request" ] && [ "${{ inputs.npm-audit-enforce }}" = "true" ]; then
+            if [ "${{ github.ref }}" = "refs/heads/${{ inputs.default-branch }}" ]                || [[ "${{ github.ref }}" == "refs/heads/${{ inputs.release-branch-prefix }}"* ]]; then
+              ENFORCE=true
+            fi
+          fi
+
+          if [ "$RC" = "0" ]; then
+            exit 0
+          fi
+          if [ "$ENFORCE" = "true" ]; then
+            echo "::error title=npm audit::Advisories at or above --audit-level=${{ inputs.npm-audit-level }} in ${{ inputs.node-workdir }}; see the job summary."
+            exit "$RC"
+          fi
+          echo "::warning title=npm audit::Advisories at or above --audit-level=${{ inputs.npm-audit-level }} in ${{ inputs.node-workdir }} (report-only on this tier); see the job summary."
+          exit 0
+
+      - name: Build
+        working-directory: ${{ inputs.node-workdir }}
+        run: ${{ inputs.node-build-command }}
+        env:
+          CI: true
+
+  # ---------------------------------------------------------------------------
+  # Images: build + scan + push via the shared pipeline. Version-family tags
+  # are applied only when this run reserved the git tag.
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Image
+    needs: [version, reserve, build-test, node-build]
+    if: >-
+      !cancelled() &&
+      needs.version.result == 'success' &&
+      needs.build-test.result == 'success' &&
+      (needs.node-build.result == 'success' || needs.node-build.result == 'skipped') &&
+      (needs.reserve.result == 'success' || needs.reserve.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(inputs.images) }}
+    uses: gks-composite/.github/.github/workflows/Docker-Build-Push.yml@main
+    secrets: inherit
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      image-name: ${{ matrix.name }}
+      context: ${{ matrix.context || '.' }}
+      dockerfile: ${{ matrix.dockerfile || 'Dockerfile' }}
+      target: ${{ matrix.target || '' }}
+      build-args: ${{ matrix.build-args || '' }}
+      version: ${{ needs.version.outputs.version }}
+      default-branch: ${{ inputs.default-branch }}
+      release-branch-prefix: ${{ inputs.release-branch-prefix }}
+      environment-tag: ${{ inputs.environment-tag }}
+      fs-scan: ${{ inputs.secret-scan }}
+      image-scan: ${{ inputs.image-scan }}
+      scan-ignore-unfixed: ${{ inputs.scan-ignore-unfixed }}
+      apply-version-tags: ${{ needs.reserve.result == 'success' }}
+
+  # ---------------------------------------------------------------------------
+  # Release - after the image push, on the tag reserved at the start.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Release v${{ needs.version.outputs.version }}
+    runs-on: ${{ inputs.runs-on }}
+    needs: [version, reserve, docker]
+    if: >-
+      !cancelled() && inputs.release &&
+      needs.reserve.result == 'success' &&
+      needs.docker.result == 'success'
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub release
+        uses: gks-composite/release-tag@v1
+        with:
+          version: ${{ needs.version.outputs.version }}
+          token: ${{ github.token }}
+          artifacts: ${{ inputs.release-artifacts }}
+          draft: ${{ inputs.release-draft }}
+
+  # ---------------------------------------------------------------------------
+  # sbx deploy dispatch - default branch only, after a successful release.
+  # Passes the concrete <version> tag: sbx App Services re-pull only when their
+  # linuxFxVersion changes, so re-applying :latest would deploy nothing.
+  # ---------------------------------------------------------------------------
+  deploy-sbx:
+    name: Deploy sbx (${{ inputs.deploy-app-key }})
+    runs-on: ${{ inputs.runs-on }}
+    needs: [version, docker, release]
+    if: >-
+      !cancelled() && inputs.deploy-sbx && inputs.deploy-app-key != '' &&
+      needs.release.result == 'success' &&
+      github.ref == format('refs/heads/{0}', inputs.default-branch)
+    steps:
+      - name: Dispatch deploy
+        uses: gks-composite/dispatch-deploy@v1
+        with:
+          app-id: ${{ vars.GKS_INFRA_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.GKS_INFRA_DISPATCH_APP_PRIVATE_KEY }}
+          target-repo: ${{ inputs.deploy-repo }}
+          workflow: ${{ inputs.deploy-workflow }}
+          stack: ${{ inputs.deploy-stack }}
+          wait: ${{ inputs.deploy-wait }}
+          apps: >-
+            [{"key":"${{ inputs.deploy-app-key }}","image":"${{ needs.docker.outputs.image }}:${{ needs.version.outputs.version }}","waitFor":"${{ inputs.deploy-wait-for }}"}]
