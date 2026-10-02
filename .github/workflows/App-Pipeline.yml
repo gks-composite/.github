@@ -172,9 +172,15 @@ on:
         type: boolean
         default: true
       scan-ignore-unfixed:
+        description: >-
+          Gate the image scan only on High/Critical findings that have a fix
+          available. Default true for app pipelines: a gate that fails on a CVE
+          nobody can fix yet is not actionable, and every version it burns is a
+          gap in the release history. Unfixed findings are still listed in the
+          job summary on every release-tier build.
         required: false
         type: boolean
-        default: false
+        default: true
       # ----- release -----
       release:
         description: 'Create the GitHub Release (on the reserved tag) after the image push.'

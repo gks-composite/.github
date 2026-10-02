@@ -93,7 +93,10 @@ on:
         type: boolean
         default: true
       scan-ignore-unfixed:
-        description: 'Only fail the image scan on vulnerabilities that have a fix available (grype only-fixed).'
+        description: >-
+          Only fail the image scan on vulnerabilities that have a fix available.
+          Unfixed findings are still listed in the job summary - this changes what
+          blocks, not what is reported.
         required: false
         type: boolean
         default: false
@@ -333,7 +336,10 @@ jobs:
         with:
           images: ${{ steps.image.outputs.ref }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
+            # latest == the most recent VERSIONED build on the default branch, so it
+            # never points at an unreleased digest (e.g. a manual dispatch on main).
+            # sbx pins :latest as its baseline, which is why this matters.
+            type=raw,value=latest,enable=${{ steps.policy.outputs.version_tags == 'true' && '{{is_default_branch}}' || 'false' }}
             type=ref,event=branch
             type=ref,event=pr
             type=sha,prefix=sha-
@@ -364,9 +370,11 @@ jobs:
           cache-from: type=gha,scope=${{ inputs.image-name }}
           cache-to: type=gha,mode=max,scope=${{ inputs.image-name }}
 
-      # fail-build is false on purpose: the gate is applied in the next step so
-      # the findings reach the job summary on a FAILING run too. Severity policy
-      # is unchanged - HIGH and CRITICAL fail.
+      # fail-build and only-fixed are both false on purpose: grype reports
+      # everything and the next step decides what blocks, so every finding reaches
+      # the job summary - on a failing run too, and including the ones that are
+      # reported but not gated. A repo-root .grype.yaml is auto-detected (no
+      # `config:` is passed) and carries per-repo accepted-risk suppressions.
       - name: Grype image scan
         id: grype
         if: ${{ inputs.image-scan && steps.policy.outputs.release_tier == 'true' }}
@@ -375,47 +383,104 @@ jobs:
           image: local-scan:${{ github.run_id }}
           fail-build: false
           severity-cutoff: high
-          only-fixed: ${{ inputs.scan-ignore-unfixed }}
+          only-fixed: false
           output-format: json
           cache-db: true
 
       - name: Report image vulnerabilities
         if: ${{ inputs.image-scan && steps.policy.outputs.release_tier == 'true' }}
         shell: bash
+        env:
+          REPORT: ${{ steps.grype.outputs.json }}
+          IGNORE_UNFIXED: ${{ inputs.scan-ignore-unfixed }}
+          IMAGE: ${{ inputs.image-name }}
         run: |
           set -uo pipefail
-          REPORT='${{ steps.grype.outputs.json }}'
           if [ -z "$REPORT" ] || [ ! -f "$REPORT" ]; then
-            echo "::warning title=grype::No scan report produced; not gating on it."
-            echo "### Image vulnerabilities (grype)" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "Scan produced no report — not gated." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+            echo "::error title=grype::The scan produced no report, so the image was not checked. Failing closed."
+            { echo "### Image vulnerabilities (grype)"; echo ""; echo "**The scan produced no report - failing closed.**"; } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
 
-          BLOCKING=$(jq '[.matches[]? | select(.vulnerability.severity == "High" or .vulnerability.severity == "Critical")] | length' "$REPORT")
-          TOTAL=$(jq '[.matches[]?] | length' "$REPORT")
+          # One classification shared by the counts and the tables, so they cannot drift.
+          cat > "$RUNNER_TEMP/gate.jq" <<'JQ'
+          def hc: .vulnerability.severity == "High" or .vulnerability.severity == "Critical";
+          # The binary classifier reads a version string out of a file. On a
+          # distro-managed path that file is owned by the OS package manager, whose
+          # matcher (dpkg/apk/rpm) reads the distro's own advisories and so accounts
+          # for backported fixes. The binary match compares the upstream version
+          # against upstream ranges instead - on Ubuntu it flagged ~45 already-patched
+          # CVEs on /usr/bin/curl and /usr/bin/openssl in every image. Trivy never
+          # matched this way either. Reported, never gated.
+          def distro_path: ((.artifact.locations // []) | length > 0)
+                           and ((.artifact.locations // []) | all(.path | test("^/(usr|bin|sbin|lib|lib32|lib64)/")));
+          def heuristic: .artifact.type == "binary" and distro_path;
+          def fixed: .vulnerability.fix.state == "fixed";
+          def blocking($iu): hc and (heuristic | not) and (fixed or ($iu | not));
+          def row: "| \(.vulnerability.severity) | \(.artifact.name) | \(.artifact.version) | \(.artifact.type) | \(.vulnerability.fix.versions // [] | join(", ") | if . == "" then "none" else . end) | \(.vulnerability.id) |";
+          JQ
+          q() { jq -L "$RUNNER_TEMP" --argjson iu "$IGNORE_UNFIXED" "include \"gate\"; $1" "$REPORT"; }
+          qr() { jq -r -L "$RUNNER_TEMP" --argjson iu "$IGNORE_UNFIXED" "include \"gate\"; $1" "$REPORT"; }
+
+          if ! TOTAL=$(q '[.matches[]?] | length'); then
+            echo "::error title=grype::The scan report could not be parsed. Failing closed."
+            exit 1
+          fi
+          BLOCKING=$(q '[.matches[]? | select(blocking($iu))] | length')
+          HEUR=$(q '[.matches[]? | select(hc and heuristic)] | length')
+          UNFIXED=$(q '[.matches[]? | select(hc and (heuristic | not) and (fixed | not))] | length')
+          ACCEPTED=$(q '[.ignoredMatches[]?] | length')
+          table_header() { echo "| Severity | Package | Version | Type | Fix | ID |"; echo "|---|---|---|---|---|---|"; }
+
           {
             echo "### Image vulnerabilities (grype)"
             echo ""
-            echo "Image: \`${{ inputs.image-name }}\` · matches: **${TOTAL}** · High+Critical: **${BLOCKING}**"
-            if [ "${BLOCKING}" != "0" ]; then
-              echo ""
-              echo "| Severity | Package | Version | Fix | ID |"
-              echo "|---|---|---|---|---|"
-              jq -r '[.matches[]? | select(.vulnerability.severity == "High" or .vulnerability.severity == "Critical")]
-                     | sort_by(.vulnerability.severity)
-                     | .[]
-                     | "| \(.vulnerability.severity) | \(.artifact.name) | \(.artifact.version) | \(.vulnerability.fix.versions // [] | join(", ") | if . == "" then "none" else . end) | \(.vulnerability.id) |"' \
-                "$REPORT" | head -50
+            echo "Image: \`${IMAGE}\` · matches: **${TOTAL}** · blocking (High+Critical): **${BLOCKING}**"
+            echo ""
+            if [ "$BLOCKING" != "0" ]; then
+              table_header
+              qr '[.matches[]? | select(blocking($iu))] | sort_by(.vulnerability.severity) | .[] | row' | sort -u | head -50
             else
+              echo "No blocking findings."
+            fi
+            if [ "$ACCEPTED" != "0" ]; then
               echo ""
-              echo "No High or Critical findings."
+              echo "<details><summary>Accepted risk: ${ACCEPTED} match(es) suppressed by the repo's <code>.grype.yaml</code></summary>"
+              echo ""
+              table_header
+              qr '.ignoredMatches[]? | row' | sort -u | head -30
+              echo ""
+              echo "</details>"
+            fi
+            if [ "$UNFIXED" != "0" ]; then
+              echo ""
+              if [ "$IGNORE_UNFIXED" = "true" ]; then
+                echo "<details><summary>Not gated: ${UNFIXED} High/Critical with no fix available yet</summary>"
+              else
+                echo "<details><summary>${UNFIXED} High/Critical with no fix available (gated: scan-ignore-unfixed is false)</summary>"
+              fi
+              echo ""
+              table_header
+              qr '.matches[]? | select(hc and (heuristic | not) and (fixed | not)) | row' | sort -u | head -30
+              echo ""
+              echo "</details>"
+            fi
+            if [ "$HEUR" != "0" ]; then
+              echo ""
+              echo "<details><summary>Not gated: ${HEUR} binary-version heuristic match(es) on distro-managed paths</summary>"
+              echo ""
+              echo "These come from reading a version string out of an OS-owned file (e.g. /usr/bin/curl) and"
+              echo "comparing it to upstream ranges, which ignores the distro's backported fixes. The OS"
+              echo "package matcher judges the same packages against the distro's own advisories."
+              echo ""
+              qr '[.matches[]? | select(hc and heuristic)] | group_by(.artifact.name) | .[] | "- `\(.[0].artifact.locations[0].path)` (\(.[0].artifact.name) \(.[0].artifact.version)): \(length) match(es)"'
+              echo ""
+              echo "</details>"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "${BLOCKING}" != "0" ]; then
-            echo "::error title=grype::${BLOCKING} High/Critical vulnerabilities in the built image; see the job summary."
+          if [ "$BLOCKING" != "0" ]; then
+            echo "::error title=grype::${BLOCKING} blocking High/Critical vulnerabilities in ${IMAGE}; see the job summary. Accept a risk with a package+version-pinned rule in the repo's .grype.yaml, never by disabling the scan."
             exit 1
           fi
 
