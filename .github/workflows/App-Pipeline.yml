@@ -23,9 +23,22 @@ name: App Pipeline
 # PR runs: version + build-test + node-build + docker only (PR images are still
 # pushed with pr-<n>/sha- tags; no version tags, no release, no deploy).
 #
-# Callers need `permissions: {contents: write, packages: write}` and
-# `secrets: inherit` (the sbx dispatch reads org var GKS_INFRA_DISPATCH_APP_ID
-# + org secret GKS_INFRA_DISPATCH_APP_PRIVATE_KEY through the caller's context).
+# Callers must grant the calling job:
+#
+#     pipeline:
+#       permissions:
+#         contents: write   # reserve the version tag + create the release
+#         packages: write   # GHCR push (implies the read that NuGet restore needs)
+#         id-token: write   # buildx provenance/SBOM attestations
+#       uses: gks-composite/.github/.github/workflows/App-Pipeline.yml@main
+#       secrets: inherit
+#
+# These go on the JOB, not only on the workflow: a called workflow's jobs can
+# never hold more than the calling job was granted, and a workflow-level block
+# that omits id-token makes the nested `docker` job a startup failure
+# ("requesting 'id-token: write', but is only allowed 'id-token: none'").
+# `secrets: inherit` is what carries org var GKS_INFRA_DISPATCH_APP_ID + org
+# secret GKS_INFRA_DISPATCH_APP_PRIVATE_KEY through to the sbx dispatch.
 # ============================================================================
 
 on:
@@ -129,6 +142,15 @@ on:
         required: false
         type: string
         default: 'high'
+      npm-audit-enforce:
+        description: >-
+          Fail release-tier builds on advisories at or above npm-audit-level.
+          Set false (with the advisories named in the caller) when a repo has a
+          known backlog it cannot clear yet - the findings still go to the job
+          summary, they just stop blocking the build.
+        required: false
+        type: boolean
+        default: true
       # ----- images -----
       images:
         description: >-
@@ -272,6 +294,13 @@ jobs:
     name: Build & Test
     runs-on: ${{ inputs.runs-on }}
     needs: version
+    # packages:read is load-bearing: restore pulls FaceFirst.* from
+    # nuget.pkg.github.com, and fcmproxy's packageSourceMapping routes that
+    # prefix there with no fallback. The workflow-level default (contents:read)
+    # would set packages:none and 401 the restore.
+    permissions:
+      contents: read
+      packages: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -388,6 +417,10 @@ jobs:
           if [ "${{ inputs.test-projects }}" = "." ]; then
             dotnet test ${{ inputs.build-target }} --configuration ${{ inputs.configuration }} --no-build
           else
+            # noglob: each line word-splits into "<csproj> [extra args]", but a
+            # filter pattern like '*Integration*' must reach dotnet verbatim -
+            # without this bash expands it against the repo root.
+            set -f
             while IFS= read -r line; do
               if [ -z "${line// }" ]; then continue; fi
               # shellcheck disable=SC2086 - the line deliberately word-splits into "<csproj> [extra args]"
@@ -494,12 +527,27 @@ jobs:
             else
               echo "No audit report produced."
             fi
-            if [ "${{ github.event_name }}" = "pull_request" ]; then
-              echo ""
-              echo "_Report-only on pull requests; enforced at \`--audit-level=${{ inputs.npm-audit-level }}\` on pushes._"
-            fi
           } >> "$GITHUB_STEP_SUMMARY"
-          exit $RC
+
+          # Enforcement tier, matching the documented contract: report-only on
+          # pull requests, enforced on default-branch / release-branch pushes.
+          # Previously this was a bare `exit $RC`, which failed PRs too.
+          ENFORCE=false
+          if [ "${{ github.event_name }}" != "pull_request" ] && [ "${{ inputs.npm-audit-enforce }}" = "true" ]; then
+            if [ "${{ github.ref }}" = "refs/heads/${{ inputs.default-branch }}" ]                || [[ "${{ github.ref }}" == "refs/heads/${{ inputs.release-branch-prefix }}"* ]]; then
+              ENFORCE=true
+            fi
+          fi
+
+          if [ "$RC" = "0" ]; then
+            exit 0
+          fi
+          if [ "$ENFORCE" = "true" ]; then
+            echo "::error title=npm audit::Advisories at or above --audit-level=${{ inputs.npm-audit-level }} in ${{ inputs.node-workdir }}; see the job summary."
+            exit "$RC"
+          fi
+          echo "::warning title=npm audit::Advisories at or above --audit-level=${{ inputs.npm-audit-level }} in ${{ inputs.node-workdir }} (report-only on this tier); see the job summary."
+          exit 0
 
       - name: Build
         working-directory: ${{ inputs.node-workdir }}

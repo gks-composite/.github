@@ -14,6 +14,10 @@ name: Docker Build and Push
 #               Version-family tags (<version>, <major.minor>, <major>) apply
 #               ONLY on release-tier builds with apply-version-tags=true, so a
 #               PR/dev/dispatch build can never mint or move a version tag.
+#               <major.minor>/<major> come from type=semver, so they appear only
+#               for semver-shaped versions (e.g. keycloak 26.6.0 -> 26.6, 26).
+#               The enterprise four-part X.Y.Z.W is not semver: those callers get
+#               <version> only, which is what the Pulumi pins use.
 #   harden   -> SBOM + provenance (+ optional cosign) on default-branch / tags
 #
 # Trivy was removed 2026-10 (DEVO-223): slow DB pulls + full-context scans on
@@ -95,10 +99,10 @@ on:
         default: false
       apply-version-tags:
         description: >-
-          Apply the <version>, <major.minor> and <major> tags. Only honored on
-          release-tier builds; callers that reserve the git tag first (App-Pipeline)
-          pass the reservation result here so an unreserved build can never move a
-          version tag.
+          Apply the <version> tag (plus <major.minor>/<major> when the version is
+          semver-shaped). Only honored on release-tier builds; callers that reserve
+          the git tag first (App-Pipeline) pass the reservation result here so an
+          unreserved build can never move a version tag.
         required: false
         type: boolean
         default: true
@@ -228,6 +232,12 @@ jobs:
           echo "release_tier=$RELEASE" >> "$GITHUB_OUTPUT"
           echo "version_tags=$VERSION_TAGS" >> "$GITHUB_OUTPUT"
           echo "Tier: release_tier=$RELEASE version_tags=$VERSION_TAGS"
+          # Loud, because a build that pushes an image WITHOUT its version tag
+          # looks successful: the operator only finds out when the tag they meant
+          # to pin does not exist.
+          if [ -n "${{ inputs.version }}" ] && [ "$VERSION_TAGS" != "true" ]; then
+            echo "::warning title=No version tags::Version ${{ inputs.version }} was supplied but this is not a release-tier build (ref=${{ github.ref }}, event=${{ github.event_name }}, default-branch=${{ inputs.default-branch }}, apply-version-tags=${{ inputs.apply-version-tags }}). Pushing branch/sha tags only - <version> and any <major>/<major.minor> tags are NOT being applied or moved."
+          fi
 
       # ----- Secrets scan (gitleaks; replaced the Trivy fs scan, DEVO-223) -----
       - name: Install gitleaks
@@ -250,8 +260,12 @@ jobs:
       - name: Secrets scan (gitleaks)
         if: ${{ inputs.fs-scan }}
         shell: bash
+        working-directory: ${{ inputs.context }}
         run: |
           set -uo pipefail
+          # Scoped to the build context, matching the scan-ref the Trivy fs step
+          # used - a repo that builds several images keeps scanning only the
+          # subdirectory each build owns.
           # Diff-scoped on PRs (checkout is fetch-depth 0 by default so the base
           # exists; shallow checkouts fall back to a tree scan). Tree scan on
           # pushes/dispatch. Findings fail the job at EVERY tier - allowlist
@@ -260,7 +274,7 @@ jobs:
              && git cat-file -e "${{ github.event.pull_request.base.sha }}^{commit}" 2>/dev/null; then
             SCOPE="PR diff (${{ github.event.pull_request.base.sha }}..HEAD)"
             /tmp/gitleaks git . \
-              --log-opts="${{ github.event.pull_request.base.sha }}..HEAD" \
+              --log-opts="${{ github.event.pull_request.base.sha }}..HEAD -- ." \
               --redact --no-banner --report-format json --report-path /tmp/gitleaks.json
           else
             SCOPE="working tree"
@@ -290,6 +304,14 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+          # gitleaks exits 1 for findings and 2+ for its own errors. Without this
+          # split a crashed scanner reports "findings: 0" and the only signal is
+          # a bare non-zero exit.
+          if [ "$RC" != "0" ] && [ "$RC" != "1" ]; then
+            echo "::error title=gitleaks::Scanner failed (exit ${RC}) - the scan did not complete, so this is not a clean result."
+          elif [ "$RC" = "1" ]; then
+            echo "::error title=gitleaks::${COUNT} secret(s) detected; see the job summary."
+          fi
           exit $RC
 
       # ----- Build tooling -----

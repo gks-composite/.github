@@ -91,7 +91,15 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ "$RC" != "0" ] && [ "${{ inputs.fail-on-findings }}" != "true" ]; then
+          # gitleaks exits 1 for findings and 2+ for its own errors. report-only
+          # mode downgrades FINDINGS to a warning - it must never downgrade a
+          # scanner crash, or a repo with leaked secrets stays green because the
+          # scan never ran.
+          if [ "$RC" != "0" ] && [ "$RC" != "1" ]; then
+            echo "::error title=gitleaks::Scanner failed (exit ${RC}) - the scan did not complete, so this is not a clean result."
+            exit "$RC"
+          fi
+          if [ "$RC" = "1" ] && [ "${{ inputs.fail-on-findings }}" != "true" ]; then
             echo "::warning title=gitleaks::${COUNT} potential secret(s) found (report-only; pass fail-on-findings: true to enforce). See the job summary."
             exit 0
           fi
