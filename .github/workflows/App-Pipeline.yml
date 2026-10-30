@@ -181,6 +181,14 @@ on:
         required: false
         type: boolean
         default: true
+      free-disk-space:
+        description: >-
+          Docker-Build-Push free-disk-space, for images that run the runner out
+          of disk: delete unused preinstalled toolchains before the image build,
+          and the loaded scan image before the push.
+        required: false
+        type: boolean
+        default: false
       # ----- release -----
       release:
         description: 'Create the GitHub Release (on the reserved tag) after the image push.'
@@ -606,6 +614,7 @@ jobs:
       fs-scan: ${{ inputs.secret-scan }}
       image-scan: ${{ inputs.image-scan }}
       scan-ignore-unfixed: ${{ inputs.scan-ignore-unfixed }}
+      free-disk-space: ${{ inputs.free-disk-space }}
       apply-version-tags: ${{ needs.reserve.result == 'success' }}
 
   # ---------------------------------------------------------------------------

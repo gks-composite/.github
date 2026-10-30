@@ -19,6 +19,9 @@ name: Docker Build and Push
 #               The enterprise four-part X.Y.Z.W is not semver: those callers get
 #               <version> only, which is what the Pulumi pins use.
 #   harden   -> SBOM + provenance (+ optional cosign) on default-branch / tags
+#   disk     -> opt-in free-disk-space: delete unused runner toolchains first
+#               and the loaded scan image after the scan, for images that run
+#               the runner out of disk (large multi-arch builds, release tier)
 #
 # Trivy was removed 2026-10 (DEVO-223): slow DB pulls + full-context scans on
 # every PR. Dependency-level vulns are covered by NuGet/npm audit in the build
@@ -139,6 +142,18 @@ on:
         required: false
         type: string
         default: 'ubuntu-latest'
+      free-disk-space:
+        description: >-
+          Free runner disk for the build. Before anything else, delete
+          preinstalled toolchains this job never uses (Android SDK, .NET,
+          Haskell, CodeQL, Swift, Boost, cached Docker images); after the
+          release-tier scan, delete the loaded scan image before the push build.
+          Opt in when the build runs out of disk - typically a large multi-arch
+          image on the release tier, which builds the image twice. GitHub-hosted
+          Linux runners only; anywhere else it warns and deletes nothing.
+        required: false
+        type: boolean
+        default: false
       fetch-depth:
         description: 'Checkout fetch depth (0 = full history, needed for versioning).'
         required: false
@@ -172,6 +187,41 @@ jobs:
       image: ${{ steps.image.outputs.ref }}
       digest: ${{ steps.push.outputs.digest }}
     steps:
+      # ----- Disk space (opt-in) -----
+      # The release tier holds the loaded scan image, the BuildKit cache and the
+      # multi-arch push build on one runner disk at once. A large multi-arch
+      # image overflows it: the job dies with "No space left on device", often
+      # with no log at all (BlobNotFound). Nothing deleted here is used by this
+      # job: global-version runs on the runner's pwsh, which stays, and
+      # gitleaks/grype/cosign are static binaries. Self-hosted runners are never
+      # touched - a deletion there would outlive the job.
+      - name: Free disk space
+        if: ${{ inputs.free-disk-space }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" != "Linux" ] || [ "${RUNNER_ENVIRONMENT:-}" != "github-hosted" ]; then
+            echo "::warning title=free-disk-space::Skipped: only GitHub-hosted Linux runners are cleaned (this one: ${RUNNER_ENVIRONMENT:-unknown} ${RUNNER_OS})."
+            exit 0
+          fi
+          avail() { df --output=avail -BG / | awk 'NR == 2 { print $1 + 0 }'; }
+          BEFORE=$(avail)
+          # Independent deletions, run in parallel. A path this runner image does
+          # not have is fine.
+          for dir in /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+                     /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/boost; do
+            sudo rm -rf "$dir" &
+          done
+          wait
+          docker image prune --all --force > /dev/null
+          AFTER=$(avail)
+          echo "Freed $((AFTER - BEFORE)) GB on /: ${BEFORE} GB -> ${AFTER} GB available."
+          {
+            echo "### Disk space"
+            echo ""
+            echo "free-disk-space freed **$((AFTER - BEFORE)) GB** before the build: ${BEFORE} GB -> ${AFTER} GB available on \`/\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -501,6 +551,14 @@ jobs:
             echo "::error title=grype::${BLOCKING} blocking High/Critical vulnerabilities in ${IMAGE}; see the job summary. Accept a risk with a package+version-pinned rule in the repo's .grype.yaml, never by disabling the scan."
             exit 1
           fi
+
+      # The loaded scan image is a full uncompressed copy in the Docker daemon,
+      # and nothing after the scan reads it. The push build below builds from
+      # the BuildKit cache, which this does not touch.
+      - name: Delete the scan image
+        if: ${{ inputs.free-disk-space && steps.build.outcome == 'success' }}
+        shell: bash
+        run: docker image rm "local-scan:${GITHUB_RUN_ID}" > /dev/null
 
       # ----- Push (real platforms, hardened on release tier) -----
       - name: Build & push image
