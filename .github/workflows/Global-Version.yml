@@ -32,7 +32,9 @@ jobs:
     outputs:
       version: ${{ inputs.version != '' && inputs.version || steps.version.outputs.version }}
     steps:
+      # Only Create Version reads the history; a given version is echoed back.
       - name: ${{ secrets.OVERRIDE_TOKEN != '' && 'Checkout repo (override)' || 'Checkout repo (default)' }}        
+        if: ${{ inputs.version == '' }}
         uses: actions/checkout@v5
         with:
           ref: ${{ github.ref }}

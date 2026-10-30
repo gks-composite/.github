@@ -105,6 +105,17 @@ on:
         required: false
         type: string
         default: ''
+      test-parallel:
+        description: >-
+          With a test-projects list: run its lines at the same time instead of
+          one after another, each with --no-build, on what the Build step
+          produced. build-target must therefore build every listed project.
+          Each project's output is printed, in list order, once all have
+          finished. Only for projects that share no fixed ports, files or
+          databases (Testcontainers with random ports are fine).
+        required: false
+        type: boolean
+        default: false
       start-azurite:
         description: 'Start an Azurite blob service on 127.0.0.1:10000 before tests (fail-loud wait).'
         required: false
@@ -461,6 +472,8 @@ jobs:
       - name: Test
         if: ${{ inputs.test-projects != '' }}
         shell: bash
+        env:
+          TEST_PARALLEL: ${{ inputs.test-parallel }}
         run: |
           set -euo pipefail
           if [ "${{ inputs.test-projects }}" = "." ]; then
@@ -470,17 +483,42 @@ jobs:
             # filter pattern like '*Integration*' must reach dotnet verbatim -
             # without this bash expands it against the repo root.
             set -f
-            while IFS= read -r line; do
-              if [ -z "${line// }" ]; then continue; fi
-              # shellcheck disable=SC2086 - the line deliberately word-splits into "<csproj> [extra args]"
-              dotnet test --project $line \
+            run_tests() {
+              dotnet test --project "$@" \
                 --configuration ${{ inputs.configuration }} \
                 --report-trx --report-github \
                 --coverage --coverage-output-format cobertura \
                 --no-ansi
+            }
+            # test-parallel: every line starts at once, with --no-build because
+            # two builds of a shared project would race. Each output goes to a
+            # file and is printed in list order once all have finished.
+            LOGS="$RUNNER_TEMP/test-logs"
+            rm -rf "$LOGS" && mkdir -p "$LOGS"
+            PIDS=()
+            NAMES=()
+            while IFS= read -r line; do
+              if [ -z "${line// }" ]; then continue; fi
+              if [ "$TEST_PARALLEL" = "true" ]; then
+                # shellcheck disable=SC2086 # the line deliberately word-splits into "<csproj> [extra args]"
+                run_tests $line --no-build < /dev/null > "$LOGS/${#PIDS[@]}.log" 2>&1 &
+                PIDS+=("$!")
+                NAMES+=("$line")
+              else
+                # shellcheck disable=SC2086 # the line deliberately word-splits into "<csproj> [extra args]"
+                run_tests $line
+              fi
             done <<'EOF'
           ${{ inputs.test-projects }}
           EOF
+            RC=0
+            for i in "${!PIDS[@]}"; do
+              if wait "${PIDS[$i]}"; then RESULT=passed; else RESULT=FAILED; RC=1; fi
+              echo "::group::${NAMES[$i]}: $RESULT"
+              cat "$LOGS/$i.log"
+              echo "::endgroup::"
+            done
+            exit "$RC"
           fi
 
       - name: Upload test results

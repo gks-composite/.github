@@ -45,6 +45,7 @@ jobs:
       # build-target: '.'
       # test-projects: |
       #   My.App.Tests/My.App.Tests.csproj
+      # test-parallel: true   # several test projects that share nothing: run them at once
       images: '[{"name":"my-image","dockerfile":"Dockerfile"}]'
       environment-tag: ${{ github.event.inputs.environment_tag || '' }}
       # deploy-sbx: true
