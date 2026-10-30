@@ -106,7 +106,7 @@ jobs:
 | `sbom` | `true` | SBOM + provenance on release-tier pushes. |
 | `sign` | `false` | Cosign keyless sign on release-tier pushes. |
 | `environment-tag` | `` | Extra raw tag for promotion. |
-| `default-branch` | `main` | Trunk branch (`dev` for the docker monorepo). |
+| `default-branch` | `main` | Trunk branch. Every FaceFirst repo integrates on `main` (`dev` was retired in DEVO-223), so callers leave this at its default. |
 | `runs-on` | `ubuntu-latest` | Runner. |
 | `free-disk-space` | `false` | Free runner disk for builds that run out of it (see below). GitHub-hosted Linux runners only. |
 | `fetch-depth` | `0` | Checkout depth (0 for versioning). |
