@@ -108,9 +108,28 @@ jobs:
 | `environment-tag` | `` | Extra raw tag for promotion. |
 | `default-branch` | `main` | Trunk branch (`dev` for the docker monorepo). |
 | `runs-on` | `ubuntu-latest` | Runner. |
+| `free-disk-space` | `false` | Free runner disk for builds that run out of it (see below). GitHub-hosted Linux runners only. |
 | `fetch-depth` | `0` | Checkout depth (0 for versioning). |
 
 There are **no secrets** to pass — the workflow uses `GITHUB_TOKEN` from the calling job.
+
+## Running out of disk (`free-disk-space`)
+
+A release-tier build (default branch, `release/*`, tags) builds the image twice on one runner disk:
+1. the single-arch image, loaded into Docker for the grype scan;
+2. the push build for every platform in `platforms`.
+
+A large multi-arch image can fill the disk. The job then dies with `No space left on device`, and sometimes
+leaves no log at all: the run page shows `BlobNotFound`.
+
+Set `free-disk-space: true` (App-Pipeline passes its own `free-disk-space` input through). It does two things:
+- **Before anything else,** it deletes preinstalled toolchains this job never uses: Android SDK, .NET, Haskell,
+  CodeQL, Swift, Boost and cached Docker images. PowerShell stays, because global-version runs on it. The job
+  summary reports how much it freed.
+- **After the release-tier scan,** it deletes the loaded scan image before the push build.
+
+On a self-hosted or non-Linux runner it only logs a warning: deleting a persistent machine's toolchains would
+outlive the job.
 
 ## Tag scheme
 
