@@ -265,6 +265,13 @@ on:
       version:
         description: 'Resolved version.'
         value: ${{ jobs.version.outputs.version }}
+      code-quality-exit-code:
+        description: >-
+          The code-quality job's exit code: 0 clean or report-only, 1 enforced
+          regression, 2 did not complete; empty when it did not run. A caller
+          with its own release job (release: false) runs
+          gks-composite/code-quality/publish-release only when this is 0.
+        value: ${{ jobs.code-quality.outputs.exit-code }}
       image:
         description: 'Fully-qualified lowercase image ref without tag (last matrix leg - meaningful for single-image repos).'
         value: ${{ jobs.docker.outputs.image }}
