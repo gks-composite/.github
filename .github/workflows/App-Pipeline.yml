@@ -12,7 +12,11 @@ name: App Pipeline
 #   node-build -> optional npm ci + audit + build (e.g. licenseserver clientapp)
 #   docker     -> matrix over `images` -> Docker-Build-Push (gitleaks secrets
 #                 scan; grype image scan + version tags on release tier only)
+#   code-quality -> optional (code-quality-languages): build warnings, tests
+#                 and coverage compared with the previous result
+#                 (gks-composite/code-quality); never blocks release or deploy
 #   release    -> GitHub Release on the reserved tag, AFTER the image push
+#                 (+ the code-quality result, on default-branch pushes)
 #   deploy-sbx -> dispatch gks-infra/ff-cloud-services deploy-app.yml with the
 #                 concrete <version> image tag (sbx App Services re-pull only
 #                 on a config change - :latest re-pushes deploy nothing)
@@ -27,9 +31,11 @@ name: App Pipeline
 #
 #     pipeline:
 #       permissions:
-#         contents: write   # reserve the version tag + create the release
-#         packages: write   # GHCR push (implies the read that NuGet restore needs)
-#         id-token: write   # buildx provenance/SBOM attestations
+#         contents: write       # reserve the version tag + create the release
+#         packages: write       # GHCR push (implies the read that NuGet restore needs)
+#         id-token: write       # buildx provenance/SBOM attestations
+#         actions: read         # code-quality: the baseline artifact lookup
+#         pull-requests: write  # code-quality: its PR comment
 #       uses: gks-composite/.github/.github/workflows/App-Pipeline.yml@main
 #       secrets: inherit
 #
@@ -37,6 +43,9 @@ name: App Pipeline
 # never hold more than the calling job was granted, and a workflow-level block
 # that omits id-token makes the nested `docker` job a startup failure
 # ("requesting 'id-token: write', but is only allowed 'id-token: none'").
+# GitHub checks that for EVERY nested job when the run starts, including jobs
+# whose `if:` would skip them - so grant actions/pull-requests even without
+# opting in to code-quality, or the whole run is rejected at startup.
 # `secrets: inherit` is what carries org var GKS_INFRA_DISPATCH_APP_ID + org
 # secret GKS_INFRA_DISPATCH_APP_PRIVATE_KEY through to the sbx dispatch.
 # ============================================================================
@@ -189,6 +198,17 @@ on:
         required: false
         type: boolean
         default: false
+      # ----- code-quality (opt-in) -----
+      code-quality-languages:
+        description: >-
+          source-check's `languages` output (one-line JSON). Non-empty runs the
+          code-quality job (gks-composite/code-quality): build warnings, tests
+          and coverage compared with the previous result, one PR comment on
+          PRs, and on default-branch pushes the result attached to the
+          release. Empty (the default) skips it.
+        required: false
+        type: string
+        default: ''
       # ----- release -----
       release:
         description: 'Create the GitHub Release (on the reserved tag) after the image push.'
@@ -245,6 +265,13 @@ on:
       version:
         description: 'Resolved version.'
         value: ${{ jobs.version.outputs.version }}
+      code-quality-exit-code:
+        description: >-
+          The code-quality job's exit code: 0 clean or report-only, 1 enforced
+          regression, 2 did not complete; empty when it did not run. A caller
+          with its own release job (release: false) runs
+          gks-composite/code-quality/publish-release only when this is 0.
+        value: ${{ jobs.code-quality.outputs.exit-code }}
       image:
         description: 'Fully-qualified lowercase image ref without tag (last matrix leg - meaningful for single-image repos).'
         value: ${{ jobs.docker.outputs.image }}
@@ -494,6 +521,62 @@ jobs:
           retention-days: 90
 
   # ---------------------------------------------------------------------------
+  # code-quality (opt-in): build warnings, tests and coverage compared with the
+  # previous result (gks-composite/code-quality). Runs when the caller passes
+  # source-check's `languages` as code-quality-languages. Report-only on PRs,
+  # enforced on release-tier pushes. A failure turns the run red but never
+  # blocks the image, the release or the deploy: the release job waits for it
+  # to finish, not to pass, and only its release-history step reads the result.
+  # ---------------------------------------------------------------------------
+  code-quality:
+    name: Code quality
+    runs-on: ${{ inputs.runs-on }}
+    if: ${{ inputs.code-quality-languages != '' }}
+    permissions:
+      contents: read         # checkout; release history (the baseline fallback)
+      actions: read          # the base branch's baseline artifact
+      packages: read         # the internal NuGet feed
+      pull-requests: write   # the PR comment (without it: the job summary)
+    outputs:
+      exit-code: ${{ steps.cq.outputs.exit-code }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # The tests code-quality runs need what build-test's tests need.
+      - name: Start Azurite
+        if: ${{ inputs.start-azurite }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name azurite -p 10000:10000 mcr.microsoft.com/azure-storage/azurite:3.37.0
+          for _ in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/127.0.0.1/10000) 2>/dev/null; then
+              echo "Azurite is accepting connections on 127.0.0.1:10000."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error title=Azurite::No listener on 127.0.0.1:10000 after 30s; storage tests would silently self-skip."
+          exit 1
+
+      # Same SDK, configuration and extra build props as build-test, so the
+      # numbers describe the build this pipeline ships. code-quality plans its
+      # own targets from `languages` and runs every test in them.
+      - name: Build, test and compare (code-quality)
+        id: cq
+        uses: gks-composite/code-quality@v1.0.1.0
+        with:
+          languages: ${{ inputs.code-quality-languages }}
+          configuration: ${{ inputs.configuration }}
+          dotnet-version: ${{ inputs.dotnet-version }}
+          dotnet-build-args: ${{ inputs.build-props }}
+          test: ${{ inputs.test-projects != '' }}
+          nuget-source: ${{ inputs.nuget-source }}
+          default-branch: ${{ inputs.default-branch }}
+          release-branch-prefix: ${{ inputs.release-branch-prefix }}
+
+  # ---------------------------------------------------------------------------
   # Optional node build (React SPA etc.)
   # ---------------------------------------------------------------------------
   node-build:
@@ -623,7 +706,9 @@ jobs:
   release:
     name: Release v${{ needs.version.outputs.version }}
     runs-on: ${{ inputs.runs-on }}
-    needs: [version, reserve, docker]
+    # code-quality is waited for (its result is attached below), never required:
+    # the `if` does not look at it.
+    needs: [version, reserve, docker, code-quality]
     if: >-
       !cancelled() && inputs.release &&
       needs.reserve.result == 'success' &&
@@ -638,6 +723,18 @@ jobs:
           token: ${{ github.token }}
           artifacts: ${{ inputs.release-artifacts }}
           draft: ${{ inputs.release-draft }}
+
+      # code-quality's release history: a clean result from a default-branch
+      # push becomes the release's code-quality.json, the baseline once its
+      # workflow artifact has expired. release/* pushes release too, but they
+      # are not trunk history. Downloads this run's artifact; runs no repo code.
+      - name: Attach code-quality results to the release
+        if: >-
+          github.ref == format('refs/heads/{0}', inputs.default-branch) &&
+          needs.code-quality.outputs.exit-code == '0'
+        uses: gks-composite/code-quality/publish-release@v1.0.1.0
+        with:
+          tag: v${{ needs.version.outputs.version }}
 
   # ---------------------------------------------------------------------------
   # sbx deploy dispatch - default branch only, after a successful release.
