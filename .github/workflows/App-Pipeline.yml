@@ -16,7 +16,8 @@ name: App Pipeline
 #                 and coverage compared with the previous result
 #                 (gks-composite/code-quality); never blocks release or deploy
 #   release    -> GitHub Release on the reserved tag, AFTER the image push
-#                 (+ the code-quality result, on default-branch pushes)
+#   code-quality-release -> attaches a clean code-quality result to that
+#                 release (opt-in, default-branch pushes only)
 #   deploy-sbx -> dispatch gks-infra/ff-cloud-services deploy-app.yml with the
 #                 concrete <version> image tag (sbx App Services re-pull only
 #                 on a config change - :latest re-pushes deploy nothing)
@@ -271,7 +272,9 @@ on:
           regression, 2 did not complete; empty when it did not run. A caller
           with its own release job (release: false) runs
           gks-composite/code-quality/publish-release only when this is 0.
-        value: ${{ jobs.code-quality.outputs.exit-code }}
+        # `|| ''`: a skipped job's outputs are null, and an expression compares
+        # null == '0' as 0 == 0. An empty string compares as a string.
+        value: ${{ jobs.code-quality.outputs.exit-code || '' }}
       image:
         description: 'Fully-qualified lowercase image ref without tag (last matrix leg - meaningful for single-image repos).'
         value: ${{ jobs.docker.outputs.image }}
@@ -525,8 +528,8 @@ jobs:
   # previous result (gks-composite/code-quality). Runs when the caller passes
   # source-check's `languages` as code-quality-languages. Report-only on PRs,
   # enforced on release-tier pushes. A failure turns the run red but never
-  # blocks the image, the release or the deploy: the release job waits for it
-  # to finish, not to pass, and only its release-history step reads the result.
+  # blocks the image, the release or the deploy: nothing but the
+  # code-quality-release job needs it.
   # ---------------------------------------------------------------------------
   code-quality:
     name: Code quality
@@ -706,9 +709,7 @@ jobs:
   release:
     name: Release v${{ needs.version.outputs.version }}
     runs-on: ${{ inputs.runs-on }}
-    # code-quality is waited for (its result is attached below), never required:
-    # the `if` does not look at it.
-    needs: [version, reserve, docker, code-quality]
+    needs: [version, reserve, docker]
     if: >-
       !cancelled() && inputs.release &&
       needs.reserve.result == 'success' &&
@@ -724,14 +725,31 @@ jobs:
           artifacts: ${{ inputs.release-artifacts }}
           draft: ${{ inputs.release-draft }}
 
-      # code-quality's release history: a clean result from a default-branch
-      # push becomes the release's code-quality.json, the baseline once its
-      # workflow artifact has expired. release/* pushes release too, but they
-      # are not trunk history. Downloads this run's artifact; runs no repo code.
+  # ---------------------------------------------------------------------------
+  # code-quality's release history (opt-in): a clean result from a
+  # default-branch push becomes the release's code-quality.json, the baseline
+  # once its workflow artifact has expired. release/* pushes release too, but
+  # they are not trunk history. Downloads this run's artifact; runs no repo code.
+  #
+  # Its own job, never a step of `release`: a job resolves all of its actions at
+  # setup, skipped steps included, so callers that did not opt in would depend
+  # on code-quality's repo access and tags. And a failed attach must not fail
+  # the release or hold back the deploy.
+  # ---------------------------------------------------------------------------
+  code-quality-release:
+    name: Attach code-quality results to v${{ needs.version.outputs.version }}
+    runs-on: ${{ inputs.runs-on }}
+    needs: [version, release, code-quality]
+    # The result check comes first: a skipped job's outputs are null, and
+    # null == '0' compares as 0 == 0, which is true.
+    if: >-
+      needs.code-quality.result == 'success' &&
+      needs.code-quality.outputs.exit-code == '0' &&
+      github.ref == format('refs/heads/{0}', inputs.default-branch)
+    permissions:
+      contents: write
+    steps:
       - name: Attach code-quality results to the release
-        if: >-
-          github.ref == format('refs/heads/{0}', inputs.default-branch) &&
-          needs.code-quality.outputs.exit-code == '0'
         uses: gks-composite/code-quality/publish-release@v1.0.1.0
         with:
           tag: v${{ needs.version.outputs.version }}
