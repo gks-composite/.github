@@ -30,6 +30,15 @@ permissions:
 
 jobs:
   pipeline:
+    # On the job, all of them: GitHub checks every App-Pipeline job's
+    # permissions when the run starts, opt-in jobs included, and rejects the
+    # whole run if one asks for more than this grants.
+    permissions:
+      contents: write       # reserve the version tag + create the release
+      packages: write       # GHCR push (implies the read NuGet restore needs)
+      id-token: write       # SBOM / provenance attestations
+      actions: read         # code-quality (opt-in): the baseline artifact lookup
+      pull-requests: write  # code-quality (opt-in): its PR comment
     uses: gks-composite/.github/.github/workflows/App-Pipeline.yml@main
     secrets: inherit
     with:
@@ -40,3 +49,6 @@ jobs:
       environment-tag: ${{ github.event.inputs.environment_tag || '' }}
       # deploy-sbx: true
       # deploy-app-key: 'identity'   # ff:apps key in ff-cloud-services
+      # Opt-in code quality: needs a source-check job in this workflow (see
+      # gks-composite/code-quality's README).
+      # code-quality-languages: ${{ needs.source-check.outputs.languages }}
