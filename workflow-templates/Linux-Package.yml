@@ -32,8 +32,12 @@ jobs:
       packages: write
     with:
       version: ${{ needs.versioner.outputs.version }}
-      # true only on the branch that releases: the image is then pushed to ghcr.io
-      releasable: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+      # false: build, test and upload the archives, publish nothing. Make it true only for the
+      # refs your release job tags, and then pass that tag as release_tag, so a version that is
+      # already released is refused before it can replace the released image in the registry:
+      #   releasable: ${{ needs.check-branch.outputs.is-releasable == 'true' }}
+      #   release_tag: v${{ needs.versioner.outputs.version }}
+      releasable: false
       image_name: facefirst-mycomponent
       packages: >-
         [{"component": "MyComponent", "serviceName": "ff-mycomponent",

@@ -36,13 +36,32 @@ pushed digest is asserted equal to the one in the manifest.
 
 ## Authentication
 
-The built-in `GITHUB_TOKEN` with `packages: write`, or the caller's `GH_PACKAGETOKEN` when it is
-set. `GH_READTOKEN` is optional and reaches a Dockerfile only as a build secret.
+The calling job grants `permissions: contents: read, packages: write`. The job logs in to
+`ghcr.io` with the caller's `GH_PACKAGETOKEN` when it is set, else the built-in `GITHUB_TOKEN`.
+`GH_READTOKEN` is optional, for a build that restores from a private feed.
+
+Both tokens reach a `prepare_command` as the environment variables `GH_PACKAGETOKEN` and
+`GH_READTOKEN`, and a Dockerfile only as build secrets, `id=github_token` and `id=read_token`,
+mounted for the `RUN` that names them:
+
+```dockerfile
+RUN --mount=type=secret,id=read_token  TOKEN=$(cat /run/secrets/read_token) ./restore.sh
+```
+
+`secrets: inherit` passes them only when the caller is in the same organization or enterprise as
+this repository. A caller outside it names them:
+
+```yaml
+    secrets:
+      GH_PACKAGETOKEN: ${{ secrets.GH_PACKAGETOKEN }}
+      GH_READTOKEN: ${{ secrets.GH_READTOKEN }}
+```
 
 ## Signing
 
-Linux packages carry no Authenticode-signed files. The packageserver Sign Sweep recognises the
-`-linux-<arch>-v` asset name and stores the archive unchanged.
+Linux packages carry nothing Authenticode can sign. The packageserver Sign Sweep is where they
+are handled: it is being taught to recognise the `-linux-<arch>-v` asset name and store the
+archive unchanged (FaceFirst-Engineering/packageserver#59).
 
 ## Example
 
@@ -52,9 +71,13 @@ jobs:
     needs: [versioner, check-branch]
     uses: gks-composite/.github/.github/workflows/Linux-Package.yml@main
     secrets: inherit
+    permissions:
+      contents: read
+      packages: write
     with:
       version: ${{ needs.versioner.outputs.version }}
       releasable: ${{ needs.check-branch.outputs.is-releasable == 'true' }}
+      release_tag: v${{ needs.versioner.outputs.version }}
       image_name: facefirst-edgex
       packages: >-
         [{"component": "FaceEncode", "serviceName": "ff-faceencode",

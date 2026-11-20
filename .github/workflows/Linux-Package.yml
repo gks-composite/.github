@@ -8,6 +8,9 @@ name: Linux container package
 #     needs: [versioner, check-branch]
 #     uses: gks-composite/.github/.github/workflows/Linux-Package.yml@main
 #     secrets: inherit
+#     permissions:
+#       contents: read
+#       packages: write
 #     with:
 #       version: ${{ needs.versioner.outputs.version }}
 #       releasable: ${{ needs.check-branch.outputs.is-releasable == 'true' }}
@@ -74,8 +77,15 @@ name: Linux container package
 #
 # Nothing secret and nothing machine-specific enters the image: build arguments are VERSION plus
 # whatever the caller lists in `build_args`. The job holds two credentials: the GitHub token it
-# logs in to ghcr.io with, and the optional GH_READTOKEN, which reaches a `prepare_command` as an
-# environment variable and a Dockerfile only as a build secret mounted for the RUN that names it.
+# logs in to ghcr.io with (GH_PACKAGETOKEN when the caller has one, else GITHUB_TOKEN) and the
+# optional GH_READTOKEN. Both reach a `prepare_command` as the environment variables
+# GH_PACKAGETOKEN and GH_READTOKEN, and a Dockerfile only as build secrets, `id=github_token` and
+# `id=read_token`, each mounted for the RUN that names it (RUN --mount=type=secret,id=read_token).
+#
+# `secrets: inherit` passes a caller's secrets only when caller and this repository are in the
+# same organization or enterprise. A caller outside it passes the two secrets by name instead;
+# with neither, the job runs on GITHUB_TOKEN alone and a build that needs GH_READTOKEN fails at
+# its restore.
 
 on:
   workflow_call:
@@ -327,7 +337,10 @@ jobs:
       - name: Refuse a version that is already released
         if: ${{ inputs.releasable && inputs.release_tag != '' }}
         env:
-          GH_TOKEN: ${{ secrets.GH_PACKAGETOKEN || secrets.GITHUB_TOKEN }}
+          # The job's own token (contents: read on the caller's repository), not GH_PACKAGETOKEN:
+          # a packages-only token gets 404 for a private repository, which reads as "no such tag"
+          # and would let an already released version through.
+          GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
@@ -610,7 +623,10 @@ jobs:
             # so a higher level costs minutes and saves nothing.
             7z a -t7z -mx=1 -bd -bso0 "$out/$asset.7z" "$stage/*"
             # Assert the layout the importer and the agent read, rather than trust the invocation.
-            7z l -ba -slt "$out/$asset.7z" | sed -n 's/^Path = //p' > "$STAGE_ROOT/entries.txt"
+            # Files only: the listing also has an entry per folder (Attributes = D ...), and the
+            # folder of a configuration file two levels down (packaging/linux) is not a stray file.
+            7z l -ba -slt "$out/$asset.7z" \
+              | awk '/^Path = /{p=substr($0,8)} /^Attributes = /{ if ($3 !~ /^D/) print p }' > "$STAGE_ROOT/entries.txt"
             grep -qx 'package.manifest' "$STAGE_ROOT/entries.txt" \
               || { echo "::error title=linux-package::$asset.7z has no package.manifest at its root"; cat "$STAGE_ROOT/entries.txt"; exit 1; }
             # Only LICENSES/ and the configuration files are in folders. Collected first, not piped
