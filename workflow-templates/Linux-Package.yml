@@ -1,0 +1,40 @@
+name: Linux container package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'version number to honor (no v... ex 9.1.0.10)'
+        required: false
+        type: string
+        default: ""
+  pull_request:
+    branches:
+      - '**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  versioner:
+    uses: gks-composite/.github/.github/workflows/Global-Version.yml@main
+    secrets: inherit
+    with:
+      version: ${{ github.event.inputs.version || '' }}
+
+  linux:
+    needs: versioner
+    uses: gks-composite/.github/.github/workflows/Linux-Package.yml@main
+    secrets: inherit
+    permissions:
+      contents: read
+      packages: write
+    with:
+      version: ${{ needs.versioner.outputs.version }}
+      # true only on the branch that releases: the image is then pushed to ghcr.io
+      releasable: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+      image_name: facefirst-mycomponent
+      packages: >-
+        [{"component": "MyComponent", "serviceName": "ff-mycomponent",
+          "dependencies": ["MessageBroker"]}]
