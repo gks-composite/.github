@@ -1,0 +1,768 @@
+name: Linux container package
+
+# The one way a FaceFirst component repository builds a Linux container package. deployment
+# ADR 0034 (docs/adr/0034-linux-container-package-contract.md in FaceFirst-Engineering/deployment)
+# is the contract; this workflow is its part 4. A caller's RunBuild.yml invokes it per image:
+#
+#   linux:
+#     needs: [versioner, check-branch]
+#     uses: gks-composite/.github/.github/workflows/Linux-Package.yml@main
+#     secrets: inherit
+#     permissions:
+#       contents: read
+#       packages: write
+#     with:
+#       version: ${{ needs.versioner.outputs.version }}
+#       releasable: ${{ needs.check-branch.outputs.is-releasable == 'true' }}
+#       image_name: facefirst-edgex
+#       packages: >-
+#         [{"component": "FaceEncode", "serviceName": "ff-faceencode",
+#           "dependencies": ["MessageBroker"], "optionalDependencies": ["CudaRuntime"]}]
+#
+# One invocation builds ONE image from packaging/linux/Dockerfile (VERSION is a required build
+# argument, the image tag is localhost/<image_name>:<version>) and then, for every entry in
+# `packages`, writes package.manifest, saves the image as an OCI archive, copies the declared
+# configuration, payload and licence files and packs a .7z, flat but for LICENSES/ and the
+# configuration files' folders, named
+#
+#   FaceFirst-<Component>-linux-<arch>-v<package version>.7z
+#
+# Each .7z is uploaded as a workflow artifact named after the asset (without the extension), so
+# the caller's release job attaches it to the GitHub release beside the Windows set. A caller
+# whose release job filters artifacts by this version (a run keeps its earlier attempts'
+# artifacts) must keep that filter for the Linux ones: never an unfiltered FaceFirst-*-linux-*.
+# On a releasable
+# ref the image is also copied to ghcr.io/<owner>/<image_name>:<version>, digest-preserved, and
+# the pushed digest is asserted equal to the one written into every manifest.
+#
+# A package entry:
+#
+#   component            required; the deployment Component enum name (FaceEncode, FaceIO, ...)
+#   packageName          default FaceFirst-<component>; the Windows asset's package name
+#   version              default the workflow's `version`; four parts. CudaRuntime passes its
+#                        <cuda>.<revision> content version
+#   image                "built" (default) - the package carries the image and ContainerImage is
+#                        <image_name>:<version>@sha256:<manifest digest>; "files" - the image is
+#                        built, and the package carries the files in its /package directory, flat
+#                        at the archive root, with ContainerImage null and no image in the archive
+#                        (a package that is files, such as CudaRuntime, still staged by a container
+#                        build so the build needs nothing on the host); "none" - payloadFiles from
+#                        the checkout only, nothing built
+#   serviceName          the systemd unit the agent writes (ff-faceencode); null for a payload
+#   serviceArgs          arguments appended to the image entrypoint; default ""
+#   dependencies         Component names; default []
+#   optionalDependencies Component names; default []
+#   containerOnly        true for a payload with no process (CudaRuntime)
+#   usesGpu              true when the package's container wants the GPU, which the deployment
+#                        client then hands over on a box with an NVIDIA GPU (deployment ADR 0035);
+#                        a package that lists CudaRuntime gets it anyway. Default false
+#   configurationFiles   checkout-relative paths; each is packed at that same path and listed by
+#                        it in ConfigurationFiles (conf/edge.conf, as the Windows broker package
+#                        has its confs under conf\). Only the message broker has any: a service
+#                        takes its settings from the NATS settings store
+#   payloadFiles         checkout-relative paths copied to the archive root (a file payload's
+#                        contents, such as the four model files)
+#
+# Licences: an image built here MUST carry the third-party licence texts its contents require
+# under /licenses; they are copied out into LICENSES/ in every package that carries the image.
+#
+# Sibling images: a Dockerfile whose FROM names another FaceFirst image of the same version
+# (VisitorServices takes libFaceFirst.TemplateCompare.so from facefirst-edgex) gets it through
+# `sibling_images`: the producing invocation sets `image_artifact: true`, the consumer lists that
+# artifact name and it is `podman load`ed before the build, so a PR run needs no registry.
+#
+# The runner's own podman, skopeo, jq and 7-Zip are used; nothing is installed. ffpack cannot run
+# here (its archive commands reach 7-Zip through Windows DLLs), and the manifest is written from
+# `packages` until ffpack manifest takes --platform and --container-image.
+#
+# Nothing secret and nothing machine-specific enters the image: build arguments are VERSION plus
+# whatever the caller lists in `build_args`. The job holds two credentials: the GitHub token it
+# logs in to ghcr.io with (GH_PACKAGETOKEN when the caller has one, else GITHUB_TOKEN) and the
+# optional GH_READTOKEN. Both reach a `prepare_command` as the environment variables
+# GH_PACKAGETOKEN and GH_READTOKEN, and a Dockerfile only as build secrets, `id=github_token` and
+# `id=read_token`, each mounted for the RUN that names it (RUN --mount=type=secret,id=read_token).
+#
+# `secrets: inherit` passes a caller's secrets only when caller and this repository are in the
+# same organization or enterprise. A caller outside it passes the two secrets by name instead;
+# with neither, the job runs on GITHUB_TOKEN alone and a build that needs GH_READTOKEN fails at
+# its restore.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Four-part version, no v (the versioner output). The image tag and the default package version.'
+        required: true
+        type: string
+      releasable:
+        description: 'The caller''s check-branch is-releasable: push the image to ghcr.io. A PR run builds, tests and uploads the .7z artifacts and publishes nothing.'
+        required: false
+        type: boolean
+        default: false
+      image_name:
+        description: 'Image name, lower-case (facefirst-edgex). Tagged localhost/<image_name>:<version>; pushed as ghcr.io/<owner>/<image_name>:<version>.'
+        required: true
+        type: string
+      dockerfile:
+        description: 'Dockerfile path, relative to the checkout.'
+        required: false
+        type: string
+        default: packaging/linux/Dockerfile
+      context:
+        description: 'Build context, relative to the checkout. The repo root: the Dockerfile reads vcpkg.json, the project files and the sources from it, and the root .dockerignore keeps local build output out.'
+        required: false
+        type: string
+        default: '.'
+      build_args:
+        description: 'Newline-separated KEY=value build arguments besides VERSION. A sibling image argument defaults inside the Dockerfile to the same version, so it is normally empty.'
+        required: false
+        type: string
+        default: ''
+      sibling_images:
+        description: 'An artifact name or glob (an earlier invocation''s image_artifact, linux-image-facefirst-edgex-v<version>) whose OCI archives are podman loaded before the build.'
+        required: false
+        type: string
+        default: ''
+      image_artifact:
+        description: 'Also upload the OCI archive as the artifact linux-image-<image_name>-v<version> (1 day), for a later invocation''s sibling_images.'
+        required: false
+        type: boolean
+        default: false
+      prepare_command:
+        description: 'A bash command run in the checkout before the build: fetching a payload the packages list (model weights from a feed). Sees VERSION, GH_PACKAGETOKEN and GH_READTOKEN.'
+        required: false
+        type: string
+        default: ''
+      test_command:
+        description: 'A bash command run after the build against the built image: sees IMAGE (localhost/<image_name>:<version>), VERSION and IMAGE_DIGEST. A non-zero exit fails the job.'
+        required: false
+        type: string
+        default: ''
+      packages:
+        description: 'JSON list of package entries (see the header). At most 4 per invocation.'
+        required: true
+        type: string
+      arch:
+        description: 'x64 (linux/amd64) or arm64 (linux/arm64). In the asset name from the first release because a rename is a new catalog identity.'
+        required: false
+        type: string
+        default: x64
+      lfs:
+        description: 'Check out Git LFS objects.'
+        required: false
+        type: boolean
+        default: false
+      layer_cache:
+        description: 'Use ghcr.io/<owner>/<image_name>-buildcache as a podman layer cache (read on every run, written only by a releasable run), so a dependency layer keyed on the dependency manifest is built once.'
+        required: false
+        type: boolean
+        default: true
+      free_disk_space:
+        description: 'Delete unused runner toolchains before the build, for an image whose build or base pull does not fit a stock runner (CudaRuntime).'
+        required: false
+        type: boolean
+        default: false
+      release_tag:
+        description: 'The git tag the caller releases this build under (v<version>). On a releasable run the job stops before building when that tag already exists on another commit: the version is released, and rebuilding it would replace its image in the registry. Empty skips the check.'
+        required: false
+        type: string
+        default: ''
+      reproducible:
+        description: 'Build with a fixed timestamp and pack with fixed file times, so the same content gives the same image digest and the same .7z bytes on every build. For a package versioned by its content (CudaRuntime), which every release rebuilds and attaches under one name.'
+        required: false
+        type: boolean
+        default: false
+      runs_on:
+        description: 'Runner label.'
+        required: false
+        type: string
+        default: ubuntu-latest
+      timeout_minutes:
+        description: 'Job timeout.'
+        required: false
+        type: number
+        default: 120
+    outputs:
+      image_digest:
+        description: 'The OCI image manifest digest written into every manifest (sha256:...); empty for a run whose packages all have image: none.'
+        value: ${{ jobs.package.outputs.image_digest }}
+      image_ref:
+        description: 'The registry reference the image was pushed to (ghcr.io/<owner>/<image_name>:<version>); empty when not releasable.'
+        value: ${{ jobs.package.outputs.image_ref }}
+      assets:
+        description: 'JSON list of the asset file names produced, in packages order.'
+        value: ${{ jobs.package.outputs.assets }}
+    secrets:
+      GH_PACKAGETOKEN:
+        description: 'Token for ghcr.io and the layer cache; GITHUB_TOKEN (packages: write) when absent.'
+        required: false
+      GH_READTOKEN:
+        description: 'Read token a prepare_command or a build secret may need for a feed outside the org.'
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  package:
+    name: Linux package ${{ inputs.image_name }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ inputs.version }}
+      IMAGE_NAME: ${{ inputs.image_name }}
+      ARCH: ${{ inputs.arch }}
+      LOCAL_IMAGE: localhost/${{ inputs.image_name }}:${{ inputs.version }}
+      # STAGE_ROOT is set by the first step: the runner context is not available in a job's env.
+    outputs:
+      image_digest: ${{ steps.save.outputs.digest }}
+      image_ref: ${{ steps.push.outputs.ref }}
+      assets: ${{ steps.validate.outputs.assets }}
+    steps:
+      # Every input the rest of the job relies on is checked here, in one place, with the error
+      # naming the entry at fault. A malformed `packages` otherwise surfaces as a jq error deep in
+      # the staging step, after a forty-minute build.
+      - name: Validate inputs
+        id: validate
+        env:
+          PACKAGES: ${{ inputs.packages }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.context }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=linux-package::$*"; exit 1; }
+          # Everything staged lives under the runner's temp directory, outside the checkout, so the
+          # checkout step cannot clean it and nothing of it can leak into the build context.
+          STAGE_ROOT="$RUNNER_TEMP/linux-package"
+          echo "STAGE_ROOT=$STAGE_ROOT" >> "$GITHUB_ENV"
+
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || fail "version must be four numeric parts with no v, got '$VERSION'"
+          [[ "$IMAGE_NAME" =~ ^[a-z0-9][a-z0-9._-]*$ ]] \
+            || fail "image_name must be lower-case [a-z0-9._-], got '$IMAGE_NAME'"
+          case "$ARCH" in
+            x64)   platform=linux/amd64 ;;
+            arm64) platform=linux/arm64 ;;
+            *)     fail "arch must be x64 or arm64, got '$ARCH'" ;;
+          esac
+          # Nothing is emulated here: the image is built and run on the runner's own architecture.
+          case "$(uname -m)" in
+            x86_64)        host=x64 ;;
+            aarch64|arm64) host=arm64 ;;
+            *)             host=$(uname -m) ;;
+          esac
+          [ "$host" = "$ARCH" ] \
+            || fail "arch is '$ARCH' but this runner is '$host': set runs_on to a runner of that architecture"
+          [[ "$DOCKERFILE" != /* && "$CONTEXT" != /* ]] \
+            || fail "dockerfile and context are checkout-relative paths"
+
+          # Normalise every entry: defaults applied, and the asset name computed once here so the
+          # staging and upload steps never derive it a second way.
+          normalized=$(jq -c --arg v "$VERSION" --arg arch "$ARCH" '
+            if type != "array" or length == 0 then error("packages must be a non-empty JSON list") else . end
+            | if length > 4 then error("at most 4 packages per invocation (\(length) given)") else . end
+            | map(
+                if type != "object" then error("each package entry must be an object") else . end
+                | if (.component // "") | test("^[A-Za-z][A-Za-z0-9]*$") | not
+                    then error("package entry needs a component name, got \(.component // "nothing" | tojson)") else . end
+                | .version = (.version // $v)
+                | if .version | test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$") | not
+                    then error("\(.component): version must be four numeric parts, got \(.version | tojson)") else . end
+                | .image = (.image // "built")
+                | if .image != "built" and .image != "files" and .image != "none"
+                    then error("\(.component): image must be \"built\", \"files\" or \"none\", got \(.image | tojson)") else . end
+                | .packageName = (.packageName // "FaceFirst-\(.component)")
+                | if (.packageName | type) != "string" or (.packageName | test("^[A-Za-z0-9][A-Za-z0-9._-]*$") | not)
+                    then error("\(.component): packageName must be letters, digits, dot, underscore or dash, got \(.packageName | tojson)") else . end
+                | .serviceName = (.serviceName // null)
+                | .serviceArgs = (.serviceArgs // "")
+                | if (.serviceName != null and (.serviceName | type) != "string") or (.serviceArgs | type) != "string"
+                    then error("\(.component): serviceName and serviceArgs are strings") else . end
+                | .dependencies = (.dependencies // [])
+                | .optionalDependencies = (.optionalDependencies // [])
+                | .containerOnly = (.containerOnly // false)
+                | .usesGpu = (.usesGpu // false)
+                | .configurationFiles = (.configurationFiles // [])
+                | .payloadFiles = (.payloadFiles // [])
+                | if ([.configurationFiles, .payloadFiles] | all(type == "array" and all(.[]; type == "string"))) | not
+                    then error("\(.component): configurationFiles and payloadFiles are lists of checkout-relative paths") else . end
+                | if (.configurationFiles | all(test("^[^/\\\\]") and (split("/") | all(. != "" and . != "." and . != "..")))) | not
+                    then error("\(.component): configurationFiles are packed at their own path, so each must be relative, with no . or .. segments, got \(.configurationFiles | tojson)") else . end
+                | if (.containerOnly | type) != "boolean"
+                    then error("\(.component): containerOnly must be true or false") else . end
+                | if (.usesGpu | type) != "boolean"
+                    then error("\(.component): usesGpu must be true or false") else . end
+                | if .containerOnly and .serviceName != null
+                    then error("\(.component): a containerOnly payload has no serviceName") else . end
+                | if (.containerOnly | not) and (.serviceName // "") == ""
+                    then error("\(.component): a service package needs a serviceName (the unit the agent writes)") else . end
+                | if .image == "none" and ((.payloadFiles + .configurationFiles) | length) == 0
+                    then error("\(.component): image: none with no payloadFiles or configurationFiles would pack an empty package") else . end
+                | if ([.dependencies[], .optionalDependencies[]] | all(type == "string")) | not
+                    then error("\(.component): dependencies and optionalDependencies are lists of Component names") else . end
+                | .asset = "\(.packageName)-linux-\($arch)-v\(.version)"
+              )
+            | if (map(.asset) | unique | length) != length
+                then error("two package entries would produce the same asset name") else . end
+          ' <<< "$PACKAGES" 2> "$RUNNER_TEMP/packages.err")             || fail "packages: $(sed 's/^jq: error (at <stdin>:[0-9]*): //' "$RUNNER_TEMP/packages.err" | head -c 600)"
+
+          mkdir -p "$STAGE_ROOT"
+          printf '%s\n' "$normalized" > "$STAGE_ROOT/packages.json"
+          echo "platform=$platform" >> "$GITHUB_OUTPUT"
+          echo "assets=$(jq -c 'map(.asset + ".7z")' <<< "$normalized")" >> "$GITHUB_OUTPUT"
+          # needs_image: a package ships the image (saved, licence-checked, pushed). builds_image: the
+          # Dockerfile is built at all, which a files package needs too.
+          echo "needs_image=$(jq -r 'any(.image == "built")' <<< "$normalized")" >> "$GITHUB_OUTPUT"
+          echo "builds_image=$(jq -r 'any(.image != "none")' <<< "$normalized")" >> "$GITHUB_OUTPUT"
+          for i in 0 1 2 3; do
+            echo "asset_$i=$(jq -r ".[$i].asset // \"\"" <<< "$normalized")" >> "$GITHUB_OUTPUT"
+          done
+          echo "Packages:"
+          jq -r '.[] | "  \(.asset).7z  component=\(.component) version=\(.version) image=\(.image) containerOnly=\(.containerOnly) usesGpu=\(.usesGpu)"' <<< "$normalized"
+
+      # A version is released once. The caller's release job is what reserves it, by its git tag,
+      # but that job runs after this one: without this check a run that computed a version already
+      # released (a dispatch pinned to it, or a second run after the first published) would build
+      # and then replace that version's image in the registry before being refused. A tag on this
+      # same commit is a re-run of the release and goes ahead. Two runs that both start before
+      # either has published still race; the push step warns when it replaces a tag.
+      - name: Refuse a version that is already released
+        if: ${{ inputs.releasable && inputs.release_tag != '' }}
+        env:
+          # The job's own token (contents: read on the caller's repository), not GH_PACKAGETOKEN:
+          # a packages-only token gets 404 for a private repository, which reads as "no such tag"
+          # and would let an already released version through.
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+            || { echo "::error title=linux-package::release_tag must be a tag name, got '$RELEASE_TAG'"; exit 1; }
+          status=$(curl -sS -o "$RUNNER_TEMP/release-tag.json" -w '%{http_code}' --retry 3 --max-time 30 \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/commits/tags/$RELEASE_TAG") || status=000
+          case "$status" in
+            404|422)
+              echo "$RELEASE_TAG does not exist yet." ;;
+            200)
+              sha=$(jq -r '.sha // empty' "$RUNNER_TEMP/release-tag.json")
+              if [ "$sha" = "$GITHUB_SHA" ]; then
+                echo "$RELEASE_TAG already points at this commit: a re-run of its release."
+              else
+                echo "::error title=linux-package::$RELEASE_TAG is already released from commit ${sha:-unknown}; this run is $GITHUB_SHA. Nothing was built or pushed."
+                exit 1
+              fi ;;
+            *)
+              echo "::error title=linux-package::Could not tell whether $RELEASE_TAG exists (HTTP $status), so nothing was built or pushed."
+              exit 1 ;;
+          esac
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: ${{ inputs.lfs }}
+          persist-credentials: false
+
+      # The same deletions gks-composite's Docker-Build-Push makes: toolchains this job never
+      # uses, worth ~25 GB on a stock runner. A CudaRuntime build pulls a 3 GB base and stages a
+      # 1.4 GB payload on top of the builder's own layers.
+      - name: Free disk space
+        if: ${{ inputs.free_disk_space }}
+        run: |
+          set -euo pipefail
+          avail() { df --output=avail -BG / | awk 'NR == 2 { print $1 + 0 }'; }
+          before=$(avail)
+          for dir in /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+                     /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/boost; do
+            sudo rm -rf "$dir" &
+          done
+          wait
+          docker image prune --all --force > /dev/null 2>&1 || true
+          echo "Freed $(( $(avail) - before )) GB; $(avail) GB available on /"
+
+      - name: Tool versions
+        run: |
+          podman --version
+          skopeo --version
+          jq --version
+          7z | sed -n '2p'
+          df -h / | tail -n 1
+
+      - name: Log in to ghcr.io
+        env:
+          TOKEN: ${{ secrets.GH_PACKAGETOKEN || secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$TOKEN" | podman login ghcr.io --username "$ACTOR" --password-stdin
+          printf '%s' "$TOKEN" | skopeo login ghcr.io --username "$ACTOR" --password-stdin
+
+      - name: Download sibling images
+        if: ${{ inputs.sibling_images != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.sibling_images }}
+          path: ${{ env.STAGE_ROOT }}/siblings
+
+      - name: Load sibling images
+        if: ${{ inputs.sibling_images != '' }}
+        env:
+          SIBLINGS: ${{ inputs.sibling_images }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tars=("$STAGE_ROOT"/siblings/*/*.tar)
+          [ "${#tars[@]}" -gt 0 ]             || { echo "::error title=linux-package::no artifact matching '$SIBLINGS' carried an OCI archive; the producing invocation needs image_artifact: true"; exit 1; }
+          for tar in "${tars[@]}"; do
+            echo "podman load $tar"
+            podman load -i "$tar"
+          done
+          podman images --format '{{.Repository}}:{{.Tag}} {{.Digest}}'
+
+      - name: Prepare
+        if: ${{ inputs.prepare_command != '' }}
+        env:
+          GH_PACKAGETOKEN: ${{ secrets.GH_PACKAGETOKEN }}
+          GH_READTOKEN: ${{ secrets.GH_READTOKEN }}
+          PREPARE: ${{ inputs.prepare_command }}
+        run: |
+          set -euo pipefail
+          bash -euo pipefail -c "$PREPARE"
+
+      # podman, not buildx: the edge runs podman, the local Build-Linux.ps1 runs podman, and a
+      # FROM that names a sibling image resolves from the local store, which buildx's container
+      # driver cannot see. --layers with a registry cache keeps the dependency layer across runs.
+      - name: Build image
+        if: ${{ steps.validate.outputs.builds_image == 'true' }}
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.context }}
+          BUILD_ARGS: ${{ inputs.build_args }}
+          PLATFORM: ${{ steps.validate.outputs.platform }}
+          LAYER_CACHE: ${{ inputs.layer_cache }}
+          REPRODUCIBLE: ${{ inputs.reproducible }}
+          # Only a releasable run refreshes the cache. Every other run only reads it: a pull request
+          # and a dispatch on a feature branch both build an unmerged branch, and a release build
+          # must never pull those layers back.
+          CACHE_WRITE: ${{ inputs.releasable }}
+          OWNER: ${{ github.repository_owner }}
+          GITHUB_SECRET: ${{ secrets.GH_PACKAGETOKEN || secrets.GITHUB_TOKEN }}
+          READ_SECRET: ${{ secrets.GH_READTOKEN }}
+        run: |
+          set -euo pipefail
+          [ -f "$DOCKERFILE" ] || { echo "::error title=linux-package::$DOCKERFILE not found in the checkout"; exit 1; }
+          [ -f "$CONTEXT/.dockerignore" ] \
+            || echo "::warning title=linux-package::$CONTEXT/.dockerignore is missing: the context is the repo root, so a local build tree is sent to the daemon (ADR 0034 part 1)"
+
+          args=(--build-arg "VERSION=$VERSION")
+          while IFS= read -r line; do
+            line="${line%$'\r'}"
+            [ -n "$line" ] || continue
+            [[ "$line" == *=* ]] || { echo "::error title=linux-package::build_args line '$line' is not KEY=value"; exit 1; }
+            args+=(--build-arg "$line")
+          done <<< "$BUILD_ARGS"
+
+          # A fixed timestamp for the image's creation time and for every file in its layers: with
+          # the same content, the image manifest digest is then the same on every build, cache or
+          # no cache. Without it each build mints a new digest for identical files.
+          if [ "$REPRODUCIBLE" = "true" ]; then args+=(--timestamp 0); fi
+
+          cache=()
+          if [ "$LAYER_CACHE" = "true" ]; then
+            ref="ghcr.io/${OWNER,,}/${IMAGE_NAME}-buildcache"
+            cache+=(--layers --cache-from "$ref")
+            [ "$CACHE_WRITE" = "true" ] && cache+=(--cache-to "$ref")
+          fi
+
+          # Build secrets, for a Dockerfile whose restore needs a feed outside the public ones (the
+          # .NET VisitorServices image reads FaceFirst.* packages): mounted into the one RUN that
+          # names them and never part of a layer or a build argument. A Dockerfile that does not
+          # mount them never sees them.
+          secrets=()
+          secretdir=$(mktemp -d)
+          trap 'rm -rf "$secretdir"' EXIT
+          printf '%s' "$GITHUB_SECRET" > "$secretdir/github_token"
+          secrets+=(--secret "id=github_token,src=$secretdir/github_token")
+          if [ -n "$READ_SECRET" ]; then
+            printf '%s' "$READ_SECRET" > "$secretdir/read_token"
+            secrets+=(--secret "id=read_token,src=$secretdir/read_token")
+          fi
+
+          echo "podman build --platform $PLATFORM -f $DOCKERFILE ${args[*]} ${cache[*]} --secret id=github_token[,id=read_token] -t $LOCAL_IMAGE $CONTEXT"
+          podman build --platform "$PLATFORM" -f "$DOCKERFILE" "${args[@]}" "${cache[@]}" "${secrets[@]}" -t "$LOCAL_IMAGE" "$CONTEXT"
+          rm -rf "$secretdir"
+          podman image inspect --format 'built {{.Id}} size {{.Size}} created {{.Created}}' "$LOCAL_IMAGE"
+
+      # The OCI archive is the form the package carries, and its index.json names the image
+      # manifest digest, which is the digest the edge sees after `podman load`. That value, not
+      # podman's local digest, is what goes into ContainerImage.
+      - name: Save OCI archive and record the digest
+        id: save
+        if: ${{ steps.validate.outputs.needs_image == 'true' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$STAGE_ROOT/image"
+          tar="$STAGE_ROOT/image/image.tar"
+          podman save --format oci-archive -o "$tar" "$LOCAL_IMAGE"
+          digest=$(tar -xOf "$tar" index.json | jq -r '.manifests[0].digest')
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error title=linux-package::could not read the image manifest digest from the OCI archive (got '$digest')"; exit 1; }
+          count=$(tar -xOf "$tar" index.json | jq '.manifests | length')
+          [ "$count" = "1" ] || { echo "::error title=linux-package::the OCI archive holds $count manifests; one image was expected"; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "OCI archive $(du -h "$tar" | cut -f1) manifest digest $digest"
+          echo "podman local digest $(podman image inspect --format '{{.Digest}}' "$LOCAL_IMAGE")"
+
+      - name: Test
+        if: ${{ inputs.test_command != '' }}
+        env:
+          IMAGE: localhost/${{ inputs.image_name }}:${{ inputs.version }}
+          IMAGE_DIGEST: ${{ steps.save.outputs.digest }}
+          TEST: ${{ inputs.test_command }}
+        run: |
+          set -euo pipefail
+          bash -euo pipefail -c "$TEST"
+
+      - name: Copy licence texts out of the image
+        if: ${{ steps.validate.outputs.needs_image == 'true' }}
+        run: |
+          set -euo pipefail
+          ctr=$(podman create "$LOCAL_IMAGE" /bin/true)
+          trap 'podman rm -f "$ctr" > /dev/null' EXIT
+          if ! podman cp "$ctr:/licenses" "$STAGE_ROOT/LICENSES" 2> /dev/null \
+             || [ -z "$(ls -A "$STAGE_ROOT/LICENSES" 2> /dev/null)" ]; then
+            echo "::error title=linux-package::$LOCAL_IMAGE carries no /licenses directory. ADR 0034 part 1: the image carries the third-party licence texts its contents require at /licenses, because the package that wraps it is what a customer receives."
+            exit 1
+          fi
+          echo "LICENSES/:"; ls -la "$STAGE_ROOT/LICENSES"
+
+      - name: Stage and pack
+        id: pack
+        env:
+          DIGEST: ${{ steps.save.outputs.digest }}
+          REPRODUCIBLE: ${{ inputs.reproducible }}
+        run: |
+          set -euo pipefail
+          out="$STAGE_ROOT/out"
+          mkdir -p "$out"
+          n=$(jq 'length' "$STAGE_ROOT/packages.json")
+          for ((i = 0; i < n; i++)); do
+            pkg=$(jq -c ".[$i]" "$STAGE_ROOT/packages.json")
+            component=$(jq -r '.component' <<< "$pkg")
+            asset=$(jq -r '.asset' <<< "$pkg")
+            image=$(jq -r '.image' <<< "$pkg")
+            stage="$STAGE_ROOT/stage/$asset"
+            rm -rf "$stage"; mkdir -p "$stage"
+            echo "::group::$asset.7z"
+
+            jq --arg image "$IMAGE_NAME" --arg tag "$VERSION" --arg digest "$DIGEST" --arg arch "$ARCH" '
+              (.version | split(".") | map(tonumber)) as $v
+              | {
+                  Component: .component,
+                  Platform: ("linux-" + $arch),
+                  ContainerImage: (if .image == "built" then "\($image):\($tag)@\($digest)" else null end),
+                  Version: { Major: $v[0], Minor: $v[1], Patch: $v[2], Build: $v[3] },
+                  ServiceName: .serviceName,
+                  ServiceArgs: .serviceArgs,
+                  ConfigurationFiles: [ .configurationFiles[] | { Path: ., Content: null } ],
+                  Dependencies: .dependencies,
+                  OptionalDependencies: .optionalDependencies,
+                  ContainerOnly: .containerOnly,
+                  UsesGpu: .usesGpu,
+                  ExeFile: null,
+                  InstalledPath: "",
+                  Hash: null
+                }' <<< "$pkg" > "$stage/package.manifest"
+
+            # A configuration file keeps its checkout path (conf/edge.conf, as in the Windows broker
+            # package), which is the Path its manifest entry names; a payload file lands at the
+            # archive root by its base name. Two inputs that would collide are a packaging mistake,
+            # not something to resolve silently.
+            while IFS=$'\t' read -r kind path; do
+              [ -n "$path" ] || continue
+              [ -f "$path" ] || { echo "::error title=linux-package::$component: file '$path' is not in the checkout (run prepare_command, or fix the path)"; exit 1; }
+              if [ "$kind" = config ]; then name="$path"; else name=$(basename "$path"); fi
+              [ ! -e "$stage/$name" ] || { echo "::error title=linux-package::$component: two files at '$name' in the archive"; exit 1; }
+              mkdir -p "$(dirname "$stage/$name")"
+              cp "$path" "$stage/$name"
+            done < <(jq -r '(.configurationFiles[] | "config\t\(.)"), (.payloadFiles[] | "payload\t\(.)")' <<< "$pkg")
+
+            if [ "$image" = "built" ]; then
+              ln "$STAGE_ROOT/image/image.tar" "$stage/image.oci.tar" 2> /dev/null \
+                || cp "$STAGE_ROOT/image/image.tar" "$stage/image.oci.tar"
+              cp -r "$STAGE_ROOT/LICENSES" "$stage/LICENSES"
+            elif [ "$image" = "files" ]; then
+              # The package is the files the container build staged in /package, not the image:
+              # copied out of a created (never started) container, flat to the archive root.
+              files="$STAGE_ROOT/files/$asset"
+              rm -rf "$files"; mkdir -p "$files"
+              ctr=$(podman create "$LOCAL_IMAGE" /bin/true)
+              podman cp "$ctr:/package/." "$files/" \
+                || { podman rm -f "$ctr" > /dev/null; echo "::error title=linux-package::$component: $LOCAL_IMAGE has no /package directory (image: files copies the package's files from there)"; exit 1; }
+              podman rm -f "$ctr" > /dev/null
+              [ -n "$(ls -A "$files")" ] || { echo "::error title=linux-package::$component: /package in $LOCAL_IMAGE is empty"; exit 1; }
+              for f in "$files"/*; do
+                base=$(basename "$f")
+                [ -f "$f" ] || { echo "::error title=linux-package::$component: /package/$base is not a file; the package is flat"; exit 1; }
+                [ ! -e "$stage/$base" ] || { echo "::error title=linux-package::$component: two files named '$base' at the archive root"; exit 1; }
+                mv "$f" "$stage/$base"
+              done
+              rm -rf "$files"
+            fi
+
+            # The runner's 7-Zip, with the wildcard quoted so 7z expands it and stores every name
+            # relative to the stage directory, package.manifest at the root. Fast
+            # compression: the image's layers are already gzip and a model payload is encrypted,
+            # so a higher level costs minutes and saves nothing.
+            zargs=(-t7z -mx=1 -bd -bso0)
+            # `reproducible`: the same content packs to the same BYTES, not only the same image
+            # digest. An archive records each entry's modification time, and package.manifest and
+            # the licence texts are written here, at pack time, so two builds of one content
+            # version differed by their timestamps alone. That matters for a package named for its
+            # content version (CudaRuntime), which every release attaches again under one name:
+            # the packageserver Sign Sweep stores a package under its asset name and refuses a
+            # second copy whose digest differs. So every entry gets one fixed time, and one thread
+            # compresses, because the stream's block layout follows the thread count.
+            if [ "$REPRODUCIBLE" = "true" ]; then
+              find "$stage" -exec touch -h -d '1980-01-01T00:00:00Z' {} +
+              zargs+=(-mmt=1 -mtc=off -mta=off)
+            fi
+            7z a "${zargs[@]}" "$out/$asset.7z" "$stage/*"
+            # Assert the layout the importer and the agent read, rather than trust the invocation.
+            # Files only: the listing also has an entry per folder (Attributes = D ...), and the
+            # folder of a configuration file two levels down (packaging/linux) is not a stray file.
+            7z l -ba -slt "$out/$asset.7z" \
+              | awk '/^Path = /{p=substr($0,8)} /^Attributes = /{ if ($3 !~ /^D/) print p }' > "$STAGE_ROOT/entries.txt"
+            grep -qx 'package.manifest' "$STAGE_ROOT/entries.txt" \
+              || { echo "::error title=linux-package::$asset.7z has no package.manifest at its root"; cat "$STAGE_ROOT/entries.txt"; exit 1; }
+            # Only LICENSES/ and the configuration files are in folders. Collected first, not piped
+            # into grep -q, whose early exit would fail the pipeline under pipefail.
+            stray=$(grep -v '^LICENSES' "$STAGE_ROOT/entries.txt" | grep '/' \
+              | grep -vxFf <(jq -r '.configurationFiles[]' <<< "$pkg") || true)
+            if [ -n "$stray" ]; then
+              echo "::error title=linux-package::$asset.7z has files in folders that are neither LICENSES/ nor configuration files:"; echo "$stray"; exit 1
+            fi
+            echo "$asset.7z ($(du -h "$out/$asset.7z" | cut -f1)):"
+            cat "$STAGE_ROOT/entries.txt"
+            rm -rf "$stage"
+            echo "::endgroup::"
+          done
+
+      # One artifact per asset, named after it, which is what the callers' release jobs collect by
+      # name pattern. The count is bounded by the validation step; an entry past the end is empty
+      # and its step is skipped.
+      - name: Upload ${{ steps.validate.outputs.asset_0 }}
+        if: ${{ steps.validate.outputs.asset_0 != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.validate.outputs.asset_0 }}
+          path: ${{ env.STAGE_ROOT }}/out/${{ steps.validate.outputs.asset_0 }}.7z
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload ${{ steps.validate.outputs.asset_1 }}
+        if: ${{ steps.validate.outputs.asset_1 != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.validate.outputs.asset_1 }}
+          path: ${{ env.STAGE_ROOT }}/out/${{ steps.validate.outputs.asset_1 }}.7z
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload ${{ steps.validate.outputs.asset_2 }}
+        if: ${{ steps.validate.outputs.asset_2 != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.validate.outputs.asset_2 }}
+          path: ${{ env.STAGE_ROOT }}/out/${{ steps.validate.outputs.asset_2 }}.7z
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload ${{ steps.validate.outputs.asset_3 }}
+        if: ${{ steps.validate.outputs.asset_3 != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.validate.outputs.asset_3 }}
+          path: ${{ env.STAGE_ROOT }}/out/${{ steps.validate.outputs.asset_3 }}.7z
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload image artifact for sibling builds
+        if: ${{ inputs.image_artifact && steps.validate.outputs.needs_image == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-image-${{ inputs.image_name }}-v${{ inputs.version }}
+          path: ${{ env.STAGE_ROOT }}/image/image.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      # Last, after the licence check, the pack and every upload: a run that fails before here
+      # publishes nothing, so the registry never holds an image whose package was not built.
+      # skopeo copies the archive's blobs as they are, so the registry's manifest digest is the
+      # archive's. podman push would recompress and could mint a different digest from the one
+      # already written into the manifests.
+      #
+      # A tag that already exists with another digest is overwritten with a warning, not refused:
+      # the caller's release job is what reserves a version, it runs after this job, and a release
+      # that failed after an earlier push has to be able to run again under the same version.
+      - name: Push image to ghcr.io
+        id: push
+        if: ${{ inputs.releasable && steps.validate.outputs.needs_image == 'true' }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+          DIGEST: ${{ steps.save.outputs.digest }}
+        run: |
+          set -euo pipefail
+          ref="ghcr.io/${OWNER,,}/${IMAGE_NAME}:${VERSION}"
+          if existing=$(skopeo inspect --format '{{.Digest}}' "docker://$ref" 2> "$STAGE_ROOT/inspect.err"); then
+            if [ "$existing" != "$DIGEST" ]; then
+              echo "::warning title=linux-package::$ref already exists with digest $existing and is being replaced by this build's $DIGEST. Expected only when an earlier run of this version failed after its push."
+            fi
+          elif ! grep -qiE 'manifest unknown|name unknown|not found' "$STAGE_ROOT/inspect.err"; then
+            # Not "the tag is absent": a registry error, a rate limit or a denied read. Say so, or
+            # a replaced tag leaves no trace in the log.
+            echo "::warning title=linux-package::Could not check whether $ref already exists ($(head -c 300 "$STAGE_ROOT/inspect.err" | tr '\n' ' ')); pushing without that check."
+          fi
+          skopeo copy --preserve-digests --digestfile "$STAGE_ROOT/pushed.digest" \
+            "oci-archive:$STAGE_ROOT/image/image.tar" "docker://$ref"
+          pushed=$(cat "$STAGE_ROOT/pushed.digest")
+          if [ "$pushed" != "$DIGEST" ]; then
+            echo "::error title=linux-package::pushed digest $pushed differs from the manifest digest $DIGEST"
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "pushed $ref@$pushed"
+
+      - name: Summary
+        if: ${{ always() && steps.validate.outcome == 'success' }}
+        env:
+          DIGEST: ${{ steps.save.outputs.digest }}
+          REF: ${{ steps.push.outputs.ref }}
+        run: |
+          {
+            echo "### Linux container package: ${IMAGE_NAME}:${VERSION} (${ARCH})"
+            echo
+            if [ -n "$DIGEST" ]; then echo "Image manifest digest: \`$DIGEST\`"; fi
+            if [ -n "$REF" ]; then echo "Pushed: \`$REF\`"; else echo "Not pushed (not a releasable ref, no image in this invocation, or the run failed before the push)."; fi
+            echo
+            echo "| Asset | Component | Version | Image | Size |"
+            echo "|---|---|---|---|---|"
+            jq -r '.[] | "\(.asset).7z|\(.component)|\(.version)|\(.image)"' "$STAGE_ROOT/packages.json" \
+              | while IFS='|' read -r asset component version image; do
+                  size=$(du -h "$STAGE_ROOT/out/$asset" 2> /dev/null | cut -f1 || echo "-")
+                  echo "| \`$asset\` | $component | $version | $image | ${size:--} |"
+                done
+          } >> "$GITHUB_STEP_SUMMARY"

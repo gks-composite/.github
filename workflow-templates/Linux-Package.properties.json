@@ -1,0 +1,7 @@
+{
+    "name": "Linux container package",
+    "description": "Build a component's Linux container image and pack it as a FaceFirst-<Component>-linux-<arch>-v<version>.7z package",
+    "iconName": "",
+    "categories": [""],
+    "filePatterns": []
+}

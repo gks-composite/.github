@@ -1,0 +1,44 @@
+name: Linux container package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'version number to honor (no v... ex 9.1.0.10)'
+        required: false
+        type: string
+        default: ""
+  pull_request:
+    branches:
+      - '**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  versioner:
+    uses: gks-composite/.github/.github/workflows/Global-Version.yml@main
+    secrets: inherit
+    with:
+      version: ${{ github.event.inputs.version || '' }}
+
+  linux:
+    needs: versioner
+    uses: gks-composite/.github/.github/workflows/Linux-Package.yml@main
+    secrets: inherit
+    permissions:
+      contents: read
+      packages: write
+    with:
+      version: ${{ needs.versioner.outputs.version }}
+      # false: build, test and upload the archives, publish nothing. Make it true only for the
+      # refs your release job tags, and then pass that tag as release_tag, so a version that is
+      # already released is refused before it can replace the released image in the registry:
+      #   releasable: ${{ needs.check-branch.outputs.is-releasable == 'true' }}
+      #   release_tag: v${{ needs.versioner.outputs.version }}
+      releasable: false
+      image_name: facefirst-mycomponent
+      packages: >-
+        [{"component": "MyComponent", "serviceName": "ff-mycomponent",
+          "dependencies": ["MessageBroker"]}]
