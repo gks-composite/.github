@@ -168,7 +168,7 @@ on:
         type: string
         default: ''
       reproducible:
-        description: 'Build with a fixed timestamp, so the same content gives the same image digest on every build. For an image versioned by its content (CudaRuntime), whose version is rebuilt by every release.'
+        description: 'Build with a fixed timestamp and pack with fixed file times, so the same content gives the same image digest and the same .7z bytes on every build. For a package versioned by its content (CudaRuntime), which every release rebuilds and attaches under one name.'
         required: false
         type: boolean
         default: false
@@ -548,6 +548,7 @@ jobs:
         id: pack
         env:
           DIGEST: ${{ steps.save.outputs.digest }}
+          REPRODUCIBLE: ${{ inputs.reproducible }}
         run: |
           set -euo pipefail
           out="$STAGE_ROOT/out"
@@ -621,7 +622,20 @@ jobs:
             # relative to the stage directory, package.manifest at the root. Fast
             # compression: the image's layers are already gzip and a model payload is encrypted,
             # so a higher level costs minutes and saves nothing.
-            7z a -t7z -mx=1 -bd -bso0 "$out/$asset.7z" "$stage/*"
+            zargs=(-t7z -mx=1 -bd -bso0)
+            # `reproducible`: the same content packs to the same BYTES, not only the same image
+            # digest. An archive records each entry's modification time, and package.manifest and
+            # the licence texts are written here, at pack time, so two builds of one content
+            # version differed by their timestamps alone. That matters for a package named for its
+            # content version (CudaRuntime), which every release attaches again under one name:
+            # the packageserver Sign Sweep stores a package under its asset name and refuses a
+            # second copy whose digest differs. So every entry gets one fixed time, and one thread
+            # compresses, because the stream's block layout follows the thread count.
+            if [ "$REPRODUCIBLE" = "true" ]; then
+              find "$stage" -exec touch -h -d '1980-01-01T00:00:00Z' {} +
+              zargs+=(-mmt=1 -mtc=off -mta=off)
+            fi
+            7z a "${zargs[@]}" "$out/$asset.7z" "$stage/*"
             # Assert the layout the importer and the agent read, rather than trust the invocation.
             # Files only: the listing also has an entry per folder (Attributes = D ...), and the
             # folder of a configuration file two levels down (packaging/linux) is not a stray file.
